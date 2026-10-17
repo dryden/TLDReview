@@ -60,6 +60,19 @@ graph TD
 
 ---
 
+## 🔑 使用前準備：取得 SerpApi API Key
+
+TL;DReview 透過 [SerpApi](https://serpapi.com/) 抓取 Google Maps 評論，使用前請先：
+
+1. 前往 [SerpApi Dashboard](https://serpapi.com/dashboard) 註冊帳號。
+2. 在 Dashboard 取得你的 **API Key**。
+3. 將 API Key 設定為環境變數 `SERPAPI_API_KEY`（或依各 Agent 整合指南設定為 Secret）。
+
+> [!TIP]
+> SerpApi 免費方案**每月可免費查詢 250 次**，個人使用通常綽綽有餘。
+
+---
+
 ## ⚡ 支援的 AI Agent 快速開始
 
 | 平台 / Agent | 整合方式 | 特色 | 指南連結 |
@@ -115,7 +128,7 @@ graph TD
 ## 🛠️ 本機獨立執行 (CLI)
 
 ```bash
-# 1. 設定 SerpApi API Key
+# 1. 設定 SerpApi API Key（至 https://serpapi.com/dashboard 註冊取得，每月免費 250 次查詢）
 export SERPAPI_API_KEY="your_api_key_here"
 
 # 2. 執行分析並輸出 Markdown
