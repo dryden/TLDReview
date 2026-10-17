@@ -90,6 +90,68 @@ def _redact_api_key(text: str, api_key: Optional[str] = None) -> str:
     return masked
 
 
+SORT_BY_ALIASES = {
+    "qualityscore": "qualityScore",
+    "relevant": "qualityScore",
+    "newest": "newestFirst",
+    "newestfirst": "newestFirst",
+    "lowest": "ratingLow",
+    "lowest_rating": "ratingLow",
+    "ratinglow": "ratingLow",
+    "highest": "ratingHigh",
+    "highest_rating": "ratingHigh",
+    "ratinghigh": "ratingHigh",
+}
+
+
+def normalize_sort_by(sort_by: Optional[str] = None) -> str:
+    """Normalize user-friendly sort aliases to SerpApi google_maps_reviews sort_by values."""
+    if not sort_by:
+        return "qualityScore"
+    key = sort_by.strip().lower()
+    if key not in SORT_BY_ALIASES:
+        valid = ", ".join(sorted(set(SORT_BY_ALIASES.values())))
+        raise ValueError(f"Unsupported sort_by '{sort_by}'. Valid options: {valid} (or newest/lowest/highest)")
+    return SORT_BY_ALIASES[key]
+
+
+def load_dotenv_if_present(dotenv_path: Optional[str] = None) -> None:
+    """Zero-dependency loader for local .env files without overriding existing env vars."""
+    candidates = [dotenv_path] if dotenv_path else [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env")),
+    ]
+    for path in candidates:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):].strip()
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except OSError:
+            pass
+
+
+def resolve_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
+    """Resolve SERPAPI_API_KEY from explicit argument, environment, or local .env file."""
+    if explicit_key:
+        return explicit_key
+    env_key = os.getenv("SERPAPI_API_KEY")
+    if env_key:
+        return env_key
+    load_dotenv_if_present()
+    return os.getenv("SERPAPI_API_KEY")
+
+
 def log(msg: str) -> None:
     """Print progress logs to stderr to avoid polluting stdout."""
     print(f"[tldreview] {_redact_api_key(msg)}", file=sys.stderr)
@@ -527,15 +589,17 @@ def fetch_serpapi_reviews(
     api_key: str,
     data_id: str,
     lang: str = "en",
-    page_token: Optional[str] = None
+    page_token: Optional[str] = None,
+    sort_by: str = "qualityScore",
 ) -> Tuple[list[Review], Optional[int], Optional[str], dict]:
     """Fetch reviews from SerpApi google_maps_reviews engine."""
+    canonical_sort = normalize_sort_by(sort_by)
     lookup = reviews_lookup_params(data_id)
     params: dict[str, Any] = {
         "api_key": api_key,
         "engine": "google_maps_reviews",
         "hl": lang,
-        "sort_by": "qualityScore",  # SerpApi value for "most relevant"
+        "sort_by": canonical_sort,
         **lookup,
     }
     if page_token:
@@ -693,9 +757,10 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
         if dist_parts:
             lines.append(f"📈 星級分布: {' | '.join(dist_parts)}")
 
+    sort_label = s.get("sort_by") or "qualityScore"
     lines.append(
         f"📊 評論抽樣: 採集 {s.get('used_reviews') or 0} 則關鍵評論 "
-        f"(來源語系: {s.get('fetch_language') or 'en'})\n"
+        f"(來源語系: {s.get('fetch_language') or 'en'} | 排序: {sort_label})\n"
     )
     lines.append("## 精選評論清單 (Evidence Data)")
     lines.append(result.get("formatted_reviews") or "")
@@ -719,11 +784,17 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
 CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
-def _cache_path(data_id: str, preferred_lang: Optional[str] = None) -> str:
+def _cache_path(
+    data_id: str,
+    preferred_lang: Optional[str] = None,
+    sort_by: str = "qualityScore",
+) -> str:
     base = os.getenv("TLDREVIEW_CACHE_DIR") or os.path.join(
         os.path.expanduser("~"), ".cache", "tldreview"
     )
     raw_key = f"{data_id}__{preferred_lang}" if preferred_lang else data_id
+    if sort_by and sort_by != "qualityScore":
+        raw_key = f"{raw_key}__{sort_by}"
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_key)
     return os.path.join(base, f"{safe}.json")
 
@@ -751,9 +822,15 @@ def run_pipeline(
     raw_input: str,
     api_key: str,
     preferred_lang: str = "zh-TW",
-    use_cache: bool = True
+    use_cache: bool = True,
+    sort_by: str = "qualityScore",
+    save_quota: bool = False,
 ) -> dict:
     """Full execution pipeline."""
+    canonical_sort = normalize_sort_by(sort_by)
+    if not save_quota and os.getenv("TLDREVIEW_SAVE_QUOTA", "").strip().lower() in {"1", "true", "yes"}:
+        save_quota = True
+
     # 1. Extract URL
     url = extract_google_maps_url(raw_input)
     if not url:
@@ -773,9 +850,11 @@ def run_pipeline(
 
     log(f"Target data_id: {data_id}")
 
-    cache_file = _cache_path(data_id)
+    cache_file = _cache_path(data_id, sort_by=canonical_sort)
     if use_cache:
-        cached = _cache_load(cache_file) or _cache_load(_cache_path(data_id, preferred_lang))
+        cached = _cache_load(cache_file) or _cache_load(
+            _cache_path(data_id, preferred_lang, sort_by=canonical_sort)
+        )
         if cached:
             log("Cache hit (< 24h) - skipping SerpApi calls")
             cached["cached"] = True
@@ -783,26 +862,30 @@ def run_pipeline(
                 cached["stats"]["preferred_summary_language"] = preferred_lang
             return cached
 
-    # 4. Fetch place details for metadata & official language
-    place_info = fetch_serpapi_place_details(api_key, data_id)
-    official_lang = infer_language(place_info.address)
-    log(f"Detected place: '{place_info.name or 'Unknown'}' in language '{official_lang}'")
-
-    # Prefer the canonical identifier returned by SerpApi for the reviews engine
-    # (e.g. URL only had a decimal CID or /g/ id).
-    review_id = data_id
-    if not is_reviews_ready_id(review_id):
-        review_id = place_info.data_id or place_info.place_id or data_id
+    # 4. Fetch place details (skipped in save_quota mode when data_id is directly usable)
+    if save_quota and is_reviews_ready_id(data_id):
+        log("Save-quota mode enabled: skipping place details call (1 SerpApi credit mode)")
+        place_info = PlaceInfo()
+        official_lang = (preferred_lang or "en").lower()
+        review_id = data_id
+    else:
+        place_info = fetch_serpapi_place_details(api_key, data_id)
+        official_lang = infer_language(place_info.address)
+        log(f"Detected place: '{place_info.name or 'Unknown'}' in language '{official_lang}'")
+        review_id = data_id
+        if not is_reviews_ready_id(review_id):
+            review_id = place_info.data_id or place_info.place_id or data_id
 
     # 5. Fetch reviews in official language
     fetch_lang = official_lang
     reviews, total_count, next_token, raw_payload = fetch_serpapi_reviews(
         api_key=api_key,
         data_id=review_id,
-        lang=fetch_lang
+        lang=fetch_lang,
+        sort_by=canonical_sort,
     )
 
-    # Merge place info if first call was sparse
+    # Merge place info if first call was sparse or skipped
     if isinstance(raw_payload.get("place_info"), dict):
         p_info = raw_payload["place_info"]
         if not place_info.name:
@@ -818,14 +901,15 @@ def run_pipeline(
             except (ValueError, TypeError):
                 pass
 
-    # Fetch second page if total reviews are large (>500) and token exists
-    if next_token and (total_count or 0) > NEXT_PAGE_THRESHOLD:
+    # Fetch second page if total reviews are large (>500), token exists, and not in save_quota mode
+    if not save_quota and next_token and (total_count or 0) > NEXT_PAGE_THRESHOLD:
         try:
             more_reviews, _, _, _ = fetch_serpapi_reviews(
                 api_key=api_key,
                 data_id=review_id,
                 lang=fetch_lang,
-                page_token=next_token
+                page_token=next_token,
+                sort_by=canonical_sort,
             )
             seen = {r.dedup_key() for r in reviews}
             for mr in more_reviews:
@@ -837,12 +921,13 @@ def run_pipeline(
         except Exception as exc:
             log(f"Second page fetch warning: {exc}")
 
-    # English refetch if recent (<2y) local guide coverage is thin and total reviews >= 10
+    # English refetch if recent (<2y) local guide coverage is thin, total reviews >= 10, and not in save_quota mode
     cutoff = datetime.now(timezone.utc) - RECENT_MAX_AGE
     local_recent_guides = [
         r for r in reviews if r.is_local_guide and _is_recent(r, cutoff)
     ]
-    if (len(local_recent_guides) < MIN_RECENT_LOCAL_GUIDES
+    if (not save_quota
+            and len(local_recent_guides) < MIN_RECENT_LOCAL_GUIDES
             and (total_count or 0) >= MIN_TOTAL_FOR_EN_REFETCH
             and fetch_lang != "en"):
         try:
@@ -850,7 +935,8 @@ def run_pipeline(
             en_reviews, _, _, _ = fetch_serpapi_reviews(
                 api_key=api_key,
                 data_id=review_id,
-                lang="en"
+                lang="en",
+                sort_by=canonical_sort,
             )
             # Merge (instead of replacing) so local-language / page-2 reviews aren't discarded
             seen = {r.dedup_key() for r in reviews}
@@ -897,6 +983,8 @@ def run_pipeline(
             "used_reviews": len(clipped),
             "fetch_language": fetch_lang,
             "preferred_summary_language": preferred_lang,
+            "sort_by": canonical_sort,
+            "save_quota": save_quota,
         },
         "formatted_reviews": format_reviews_block(clipped),
         "reviews": [
@@ -923,8 +1011,18 @@ def main() -> int:
         description="Extract and curate Google Maps reviews for LLM summarization."
     )
     parser.add_argument("url", help="Google Maps link or text containing a Google Maps link")
-    parser.add_argument("--api-key", help="SerpApi API Key (or set SERPAPI_API_KEY environment variable)")
+    parser.add_argument("--api-key", help="SerpApi API Key (or set SERPAPI_API_KEY in environment / .env)")
     parser.add_argument("--lang", default="zh-TW", help="Preferred summary language code (default: zh-TW)")
+    parser.add_argument(
+        "--sort-by",
+        default="qualityScore",
+        help="Review sort order: qualityScore (relevant), newest (newestFirst), lowest (ratingLow), highest (ratingHigh)",
+    )
+    parser.add_argument(
+        "--save-quota",
+        action="store_true",
+        help="Consume only 1 SerpApi call per place by skipping place details and multi-page/English refetches",
+    )
     parser.add_argument("--markdown", action="store_true", help="Output high-density human/LLM-readable Markdown")
     parser.add_argument("--no-cache", action="store_true", help="Ignore the 24h review cache and force fresh SerpApi calls")
     parser.add_argument("--parse-only", action="store_true", help="Only parse URL and data_id without calling SerpApi")
@@ -948,16 +1046,23 @@ def main() -> int:
         }, indent=2, ensure_ascii=False), file=sys.stdout)
         return 0
 
-    api_key = args.api_key or os.getenv("SERPAPI_API_KEY")
+    api_key = resolve_api_key(args.api_key)
     if not api_key:
         print(
-            "Error: SerpApi API Key is required. Provide via --api-key or set SERPAPI_API_KEY in environment.",
+            "Error: SerpApi API Key is required. Provide via --api-key, SERPAPI_API_KEY env var, or .env file.",
             file=sys.stderr
         )
         return 1
 
     try:
-        result = run_pipeline(args.url, api_key, preferred_lang=args.lang, use_cache=not args.no_cache)
+        result = run_pipeline(
+            args.url,
+            api_key,
+            preferred_lang=args.lang,
+            use_cache=not args.no_cache,
+            sort_by=args.sort_by,
+            save_quota=args.save_quota,
+        )
     except Exception as exc:
         safe_err = _redact_api_key(str(exc), api_key)
         print(json.dumps({"status": "error", "message": safe_err}), file=sys.stdout)

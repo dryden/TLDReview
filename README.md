@@ -131,11 +131,14 @@ TL;DReview 透過 [SerpApi](https://serpapi.com/) 抓取 Google Maps 評論，�
 ## 🛠️ 本機獨立執行 (CLI)
 
 ```bash
-# 1. 設定 SerpApi API Key（至 https://serpapi.com/dashboard 註冊取得，每月免費 250 次查詢）
+# 1. 設定 SerpApi API Key（可 export 環境變數，或直接複製 .env.example 為 .env 填入）
 export SERPAPI_API_KEY="your_api_key_here"
 
 # 2. 直接執行核心腳本（零依賴，免安裝任何第三方套件）
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --markdown
+
+# 進階選項：指定排序（newest / lowest / highest）或開啟省額度模式（--save-quota，每次僅耗 1 點額度）
+python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --sort-by newest --save-quota --markdown
 
 # 或輸出給其他程式使用的 JSON
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample"

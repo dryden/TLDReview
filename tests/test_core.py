@@ -227,6 +227,60 @@ class TestTLDReviewCore(unittest.TestCase):
             self.assertEqual(data, {"ok": True})
             self.assertEqual(mock_open.call_count, 2)
 
+    def test_dotenv_loader_and_resolve_api_key(self) -> None:
+        from core.tldreview_tool import load_dotenv_if_present, resolve_api_key
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_file = os.path.join(tmpdir, ".env")
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.write("# Comment line\nexport SERPAPI_API_KEY='dotenv_loaded_key_123'\n")
+
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("SERPAPI_API_KEY", None)
+                load_dotenv_if_present(env_file)
+                self.assertEqual(resolve_api_key(), "dotenv_loaded_key_123")
+
+    def test_save_quota_and_sort_by_options(self) -> None:
+        from core.tldreview_tool import normalize_sort_by
+
+        self.assertEqual(normalize_sort_by("newest"), "newestFirst")
+        self.assertEqual(normalize_sort_by("lowest"), "ratingLow")
+        self.assertEqual(normalize_sort_by("highest"), "ratingHigh")
+        self.assertEqual(normalize_sort_by("relevant"), "qualityScore")
+
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        sample_reviews = [
+            Review(author="Reviewer1", text="最新負評避雷", rating=1.0, published_at=recent_iso, review_id="r1")
+        ]
+        raw_payload = {
+            "place_info": {"title": "測試餐廳", "address": "台北市", "type": "餐廳", "rating": 3.9}
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"TLDREVIEW_CACHE_DIR": tmpdir}
+        ), patch(
+            "core.tldreview_tool.fetch_serpapi_place_details"
+        ) as mock_details, patch(
+            "core.tldreview_tool.fetch_serpapi_reviews",
+            return_value=(sample_reviews, 800, "next_page_tok", raw_payload),
+        ) as mock_reviews:
+            url = "https://www.google.com/maps/place/Test/data=!3m1!1s0x3442abb6da9c9e1f:0x123456789abcdef0"
+            res = run_pipeline(
+                url,
+                api_key="dummy_key",
+                preferred_lang="zh-TW",
+                use_cache=False,
+                sort_by="lowest",
+                save_quota=True,
+            )
+            # In save_quota mode, place_details, page 2, and EN refetch are all skipped (strictly 1 call!)
+            self.assertEqual(mock_details.call_count, 0)
+            self.assertEqual(mock_reviews.call_count, 1)
+            self.assertEqual(res["stats"]["sort_by"], "ratingLow")
+            self.assertTrue(res["stats"]["save_quota"])
+            self.assertEqual(res["place"]["name"], "測試餐廳")
+            self.assertEqual(res["place"]["type"], "餐廳")
+
 
 if __name__ == "__main__":
     unittest.main()
