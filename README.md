@@ -28,8 +28,6 @@
 
 Google Maps' built-in AI summary is at most three generic lines long, forcing you to scroll through dozens of raw reviews anyway.
 
-![Google Maps Review Summary vs. TL;DReview Report](docs/images/gmaps-vs-tldreview.png)
-
 TL;DReview filters and organizes reviews into actionable categories—**pros, cons, red flags, and insider tips**—giving you the complete picture at a glance.
 
 Plus, because it runs inside your AI assistant, you can:
