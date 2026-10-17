@@ -82,9 +82,17 @@ COUNTRY_NAMES = {
 }
 
 
+def _redact_api_key(text: str, api_key: Optional[str] = None) -> str:
+    """Mask SerpApi keys in URLs or exception messages to prevent accidental leaks."""
+    masked = re.sub(r"(api_key=)[^&\s\"']+", r"\1***", text, flags=re.IGNORECASE)
+    if api_key and len(api_key) >= 4:
+        masked = masked.replace(api_key, "***")
+    return masked
+
+
 def log(msg: str) -> None:
     """Print progress logs to stderr to avoid polluting stdout."""
-    print(f"[tldreview] {msg}", file=sys.stderr)
+    print(f"[tldreview] {_redact_api_key(msg)}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +107,7 @@ class Review:
     published_at: Optional[str] = None  # ISO8601 UTC
     is_local_guide: Optional[bool] = None
     like_count: Optional[int] = None
+    review_id: Optional[str] = None
 
     def published_dt(self) -> Optional[datetime]:
         if not self.published_at:
@@ -111,6 +120,12 @@ class Review:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
+
+    def dedup_key(self) -> Tuple[str, str]:
+        """Return a stable deduplication key across pages and languages."""
+        if self.review_id:
+            return ("id", self.review_id)
+        return (self.author, self.published_at or self.text)
 
 
 @dataclass
@@ -133,7 +148,7 @@ class PlaceInfo:
 def extract_google_maps_url(text: str) -> Optional[str]:
     """Extract a Google Maps URL from free-form text or link wrappers."""
     for match in _URL_RE.finditer(text):
-        candidate = match.group(0).rstrip(").,;'\"")
+        candidate = match.group(0).rstrip(").,;'\"!?]>）！？，。、】》」』")
         # Handle Instagram redirect wrapper: l.instagram.com/?u=...
         host = urllib.parse.urlparse(candidate).netloc.lower()
         if host.endswith("instagram.com"):
@@ -298,6 +313,7 @@ def infer_language(address: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 def http_get_json(url: str, params: dict[str, Any]) -> dict:
     """Perform HTTP GET request and return JSON object."""
+    api_key = str(params.get("api_key") or "")
     qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     full_url = f"{url}?{qs}"
     req = urllib.request.Request(
@@ -309,10 +325,11 @@ def http_get_json(url: str, params: dict[str, Any]) -> dict:
             data = resp.read().decode("utf-8", "replace")
             return json.loads(data)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"SerpApi HTTP {exc.code}: {body}") from exc
+        body = _redact_api_key(exc.read().decode("utf-8", "replace"), api_key)
+        raise RuntimeError(f"SerpApi HTTP {exc.code}: {body}") from None
     except Exception as exc:
-        raise RuntimeError(f"Network request to SerpApi failed: {exc}") from exc
+        safe_msg = _redact_api_key(str(exc), api_key)
+        raise RuntimeError(f"Network request to SerpApi failed: {safe_msg}") from None
 
 
 def place_lookup_params(data_id: str) -> Optional[dict[str, str]]:
@@ -435,6 +452,8 @@ def parse_raw_reviews(payload: dict) -> list[Review]:
 
         user = entry.get("user") if isinstance(entry.get("user"), dict) else {}
         author = user.get("name") or entry.get("author") or "Anonymous"
+        raw_id = entry.get("review_id") or entry.get("id")
+        review_id = str(raw_id).strip() if raw_id else None
 
         # Rating
         rating = None
@@ -472,6 +491,7 @@ def parse_raw_reviews(payload: dict) -> list[Review]:
                 published_at=published_at,
                 is_local_guide=is_local_guide,
                 like_count=likes,
+                review_id=review_id,
             )
         )
     return reviews
@@ -520,30 +540,38 @@ def fetch_serpapi_reviews(
 # ---------------------------------------------------------------------------
 # Step 3: Selection, Curation & Token Optimization
 # ---------------------------------------------------------------------------
+def _is_recent(r: Review, cutoff: datetime) -> bool:
+    """Return True if review is within cutoff window or has no parseable date."""
+    dt = r.published_dt()
+    return dt is None or dt >= cutoff
+
+
 def curate_reviews(reviews: list[Review]) -> list[Review]:
-    """Curate reviews by prioritizing recent Local Guides, high likes, and pad to 10."""
+    """Curate reviews by prioritizing recent Local Guides, critical low ratings, high likes, and pad to 10."""
     if not reviews:
         return []
 
     cutoff = datetime.now(timezone.utc) - RECENT_MAX_AGE
     guides: list[Review] = []
+    critical: list[Review] = []
     liked: list[Review] = []
     others: list[Review] = []
 
     for r in reviews:
-        dt = r.published_dt()
         # Keep if within 2 years or if date is missing (can't determine age)
-        if dt and dt < cutoff:
+        if not _is_recent(r, cutoff):
             continue
 
         if r.is_local_guide:
             guides.append(r)
+        elif r.rating is not None and r.rating <= 3.0:
+            critical.append(r)
         elif (r.like_count or 0) > 1:
             liked.append(r)
         else:
             others.append(r)
 
-    selected = guides + liked + others
+    selected = guides + critical + liked + others
 
     # If < 10, pad with remaining reviews to ensure sufficient evidence
     if len(selected) < MIN_SELECTED_REVIEWS:
@@ -555,6 +583,18 @@ def curate_reviews(reviews: list[Review]) -> list[Review]:
                     break
 
     return selected or reviews
+
+
+def _smart_truncate(text: str, limit: int) -> str:
+    """Truncate text up to limit, preferring a natural sentence boundary near the end."""
+    if len(text) <= limit:
+        return text
+    chunk = text[:limit]
+    min_boundary = int(limit * 0.8)
+    for idx in range(len(chunk) - 1, min_boundary - 1, -1):
+        if chunk[idx] in "。！？.!?\n":
+            return chunk[: idx + 1].rstrip()
+    return chunk.rstrip()
 
 
 def clip_reviews_for_prompt(reviews: list[Review]) -> list[Tuple[Review, str]]:
@@ -571,7 +611,7 @@ def clip_reviews_for_prompt(reviews: list[Review]) -> list[Tuple[Review, str]]:
 
         # Single review length limit
         if len(text) > MAX_SINGLE_REVIEW_CHARS:
-            text = text[:MAX_SINGLE_REVIEW_CHARS].rstrip()
+            text = _smart_truncate(text, MAX_SINGLE_REVIEW_CHARS)
             cut = True
 
         # Total review budget limit
@@ -579,7 +619,7 @@ def clip_reviews_for_prompt(reviews: list[Review]) -> list[Tuple[Review, str]]:
         if len(text) > remaining:
             if remaining <= 10:
                 break
-            text = text[: remaining - 1].rstrip()
+            text = _smart_truncate(text, remaining - 1)
             cut = True
 
         if not text:
@@ -601,7 +641,7 @@ def format_reviews_block(clipped: list[Tuple[Review, str]]) -> str:
     """Format reviews into high-density numbered lines for the LLM."""
     lines: list[str] = []
     for idx, (r, text) in enumerate(clipped, 1):
-        rating_str = f" ★{r.rating:.0f}" if r.rating else ""
+        rating_str = f" ★{r.rating:.0f}" if r.rating is not None else ""
         date_str = f" ({r.relative_time})" if r.relative_time else ""
         guide_str = " [Local Guide]" if r.is_local_guide else ""
         likes_str = f" [+{r.like_count} helpful]" if (r.like_count or 0) > 0 else ""
@@ -609,14 +649,56 @@ def format_reviews_block(clipped: list[Tuple[Review, str]]) -> str:
     return "\n".join(lines)
 
 
+def format_markdown_output(result: dict, include_agent_instructions: bool = False) -> str:
+    """Format pipeline result into a structured Markdown digest for CLI, MCP, and LangChain."""
+    p = result.get("place") or {}
+    s = result.get("stats") or {}
+    avg_rating = p.get("average_rating")
+    rating_str = f"⭐ {avg_rating:.1f}" if avg_rating is not None else "⭐ 暫無評分"
+
+    lines = [f"# {p.get('name') or 'Google Maps Place'}"]
+    if p.get("address"):
+        lines.append(f"📍 地址: {p['address']}")
+    lines.append(f"🏷️ 分類: {p.get('type') or 'unknown'} | {rating_str} (總評數: {p.get('total_reviews') or 0})")
+
+    rs = p.get("rating_summary") or {}
+    if rs:
+        dist_parts = [f"{star}★({rs[str(star)]})" for star in (5, 4, 3, 2, 1) if str(star) in rs]
+        if dist_parts:
+            lines.append(f"📈 星級分布: {' | '.join(dist_parts)}")
+
+    lines.append(
+        f"📊 評論抽樣: 採集 {s.get('used_reviews') or 0} 則關鍵評論 "
+        f"(來源語系: {s.get('fetch_language') or 'en'})\n"
+    )
+    lines.append("## 精選評論清單 (Evidence Data)")
+    lines.append(result.get("formatted_reviews") or "")
+
+    if include_agent_instructions:
+        target_lang = s.get("preferred_summary_language") or "zh-TW"
+        lines.extend([
+            "",
+            "---",
+            f"## 🦊 TL;DReview 分析與排版規範 (請以 `{target_lang}` 輸出)",
+            "請嚴格根據上方精選評論證據（Evidence Data）產出結構化報告：",
+            "1. **嚴禁幻覺（Anti-Hallucination）**：所有優缺點、招牌菜色、消費規則必須 100% 來自上述評論，未提及的維度請直接整段省略。",
+            "2. **評分操縱示警**：若評論提及「五星好評送飲料/小菜/折價」等刷評活動，或星級呈極端 M 型分布，請務必於「💡 營運洞察與消費規則」明確示警。",
+            "3. **兩極評價標註**：若同一項目評價分歧，請標註「（評價兩極）」並平實呈現雙方觀點。",
+            "4. **7 大標準維度**：🍜 必點招牌 / 核心亮點、👍 優勢與推薦點、👎 缺點與避雷提醒、💡 營運洞察與消費規則、🤫 內行人的秘密撇步、🚗 交通與停車指南、🚨 特別點名。",
+        ])
+
+    return "\n".join(lines)
+
+
 CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
-def _cache_path(data_id: str, preferred_lang: str) -> str:
+def _cache_path(data_id: str, preferred_lang: Optional[str] = None) -> str:
     base = os.getenv("TLDREVIEW_CACHE_DIR") or os.path.join(
         os.path.expanduser("~"), ".cache", "tldreview"
     )
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{data_id}__{preferred_lang}")
+    raw_key = f"{data_id}__{preferred_lang}" if preferred_lang else data_id
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw_key)
     return os.path.join(base, f"{safe}.json")
 
 
@@ -665,12 +747,14 @@ def run_pipeline(
 
     log(f"Target data_id: {data_id}")
 
-    cache_file = _cache_path(data_id, preferred_lang)
+    cache_file = _cache_path(data_id)
     if use_cache:
-        cached = _cache_load(cache_file)
+        cached = _cache_load(cache_file) or _cache_load(_cache_path(data_id, preferred_lang))
         if cached:
             log("Cache hit (< 24h) - skipping SerpApi calls")
             cached["cached"] = True
+            if isinstance(cached.get("stats"), dict):
+                cached["stats"]["preferred_summary_language"] = preferred_lang
             return cached
 
     # 4. Fetch place details for metadata & official language
@@ -693,10 +777,20 @@ def run_pipeline(
     )
 
     # Merge place info if first call was sparse
-    if not place_info.name and isinstance(raw_payload.get("place_info"), dict):
+    if isinstance(raw_payload.get("place_info"), dict):
         p_info = raw_payload["place_info"]
-        place_info.name = p_info.get("title") or place_info.name
-        place_info.address = p_info.get("address") or place_info.address
+        if not place_info.name:
+            place_info.name = p_info.get("title") or place_info.name
+        if not place_info.address:
+            place_info.address = p_info.get("address") or place_info.address
+        if not place_info.types and p_info.get("type"):
+            p_type = p_info.get("type")
+            place_info.types = [p_type] if isinstance(p_type, str) else list(p_type)
+        if place_info.average_rating is None and p_info.get("rating") is not None:
+            try:
+                place_info.average_rating = float(p_info["rating"])
+            except (ValueError, TypeError):
+                pass
 
     # Fetch second page if total reviews are large (>500) and token exists
     if next_token and (total_count or 0) > NEXT_PAGE_THRESHOLD:
@@ -707,18 +801,21 @@ def run_pipeline(
                 lang=fetch_lang,
                 page_token=next_token
             )
-            # Deduplicate by author + text
-            seen = {(r.author, r.text) for r in reviews}
+            seen = {r.dedup_key() for r in reviews}
             for mr in more_reviews:
-                if (mr.author, mr.text) not in seen:
+                key = mr.dedup_key()
+                if key not in seen:
                     reviews.append(mr)
-                    seen.add((mr.author, mr.text))
+                    seen.add(key)
             log(f"Merged second page -> {len(reviews)} total fetched reviews")
         except Exception as exc:
             log(f"Second page fetch warning: {exc}")
 
-    # English refetch if local guide coverage is thin and total reviews >= 10
-    local_recent_guides = [r for r in reviews if r.is_local_guide]
+    # English refetch if recent (<2y) local guide coverage is thin and total reviews >= 10
+    cutoff = datetime.now(timezone.utc) - RECENT_MAX_AGE
+    local_recent_guides = [
+        r for r in reviews if r.is_local_guide and _is_recent(r, cutoff)
+    ]
     if (len(local_recent_guides) < MIN_RECENT_LOCAL_GUIDES
             and (total_count or 0) >= MIN_TOTAL_FOR_EN_REFETCH
             and fetch_lang != "en"):
@@ -730,10 +827,10 @@ def run_pipeline(
                 lang="en"
             )
             # Merge (instead of replacing) so local-language / page-2 reviews aren't discarded
-            seen = {(r.author, r.published_at or r.text) for r in reviews}
+            seen = {r.dedup_key() for r in reviews}
             added = 0
             for er in en_reviews:
-                key = (er.author, er.published_at or er.text)
+                key = er.dedup_key()
                 if key not in seen:
                     reviews.append(er)
                     seen.add(key)
@@ -765,7 +862,7 @@ def run_pipeline(
             "type": place_info.types[0] if place_info.types else "unknown",
             "all_types": place_info.types,
             "average_rating": place_info.average_rating,
-            "total_reviews": total_count or len(reviews),
+            "total_reviews": total_count or place_info.total_reviews or len(reviews),
             "rating_summary": place_info.rating_summary,
         },
         "stats": {
@@ -836,8 +933,9 @@ def main() -> int:
     try:
         result = run_pipeline(args.url, api_key, preferred_lang=args.lang, use_cache=not args.no_cache)
     except Exception as exc:
-        print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stdout)
-        log(f"Execution failed: {exc}")
+        safe_err = _redact_api_key(str(exc), api_key)
+        print(json.dumps({"status": "error", "message": safe_err}), file=sys.stdout)
+        log(f"Execution failed: {safe_err}")
         return 1
 
     if result.get("status") == "no_reviews":
@@ -845,16 +943,7 @@ def main() -> int:
         return 2
 
     if args.markdown:
-        p = result["place"]
-        s = result["stats"]
-        rating_str = f"⭐ {p['average_rating']:.1f}" if p.get("average_rating") else "⭐ 暫無評分"
-        print(f"# {p['name']}")
-        if p.get("address"):
-            print(f"📍 地址: {p['address']}")
-        print(f"🏷️ 分類: {p['type']} | {rating_str} (總評數: {p['total_reviews']})")
-        print(f"📊 評論抽樣: 採集 {s['used_reviews']} 則關鍵評論 (來源語系: {s['fetch_language']})\n")
-        print("## 精選評論清單 (Evidence Data)")
-        print(result["formatted_reviews"])
+        print(format_markdown_output(result, include_agent_instructions=False))
     else:
         print(json.dumps(result, indent=2, ensure_ascii=False), file=sys.stdout)
 

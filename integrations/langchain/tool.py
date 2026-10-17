@@ -3,7 +3,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from core.tldreview_tool import run_pipeline
+from core.tldreview_tool import format_markdown_output, run_pipeline
 
 try:
     from langchain.tools import tool
@@ -22,6 +22,6 @@ def tldreview_maps_tool(url: str, lang: str = "zh-TW") -> str:
         res = run_pipeline(raw_input=url, api_key=api_key, preferred_lang=lang)
         if res.get("status") == "no_reviews":
             return "No public reviews found for this place."
-        return res.get("formatted_reviews", "")
+        return format_markdown_output(res, include_agent_instructions=True)
     except Exception as exc:
         return f"Error: {exc}"

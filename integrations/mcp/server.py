@@ -9,7 +9,7 @@ import sys
 
 # Ensure core is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from core.tldreview_tool import run_pipeline
+from core.tldreview_tool import format_markdown_output, run_pipeline
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -45,17 +45,7 @@ def summarize_google_maps_reviews(url: str, lang: str = "zh-TW") -> str:
     if result.get("status") == "no_reviews":
         return f"Location '{result.get('place', {}).get('name')}' has no public reviews on Google Maps."
 
-    p = result["place"]
-    s = result["stats"]
-    lines = [
-        f"# {p['name']}",
-        f"📍 地址: {p['address'] or 'N/A'}",
-        f"🏷️ 類型: {p['type']} | ⭐ {p['average_rating'] or 'N/A'} (總評數: {p['total_reviews']})",
-        f"📊 評論抽樣: 採集 {s['used_reviews']} 則關鍵評論 (語系: {s['fetch_language']})\n",
-        "## 精選評論清單 (Evidence Data)",
-        result["formatted_reviews"]
-    ]
-    return "\n".join(lines)
+    return format_markdown_output(result, include_agent_instructions=True)
 
 if __name__ == "__main__":
     mcp.run()
