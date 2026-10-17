@@ -184,6 +184,49 @@ class TestTLDReviewCore(unittest.TestCase):
             self.assertIn("📈 星級分布: 5★(100) | 1★(20)", md)
             self.assertIn("TL;DReview 分析與排版規範", md)
 
+    def test_resolve_short_url_unwraps_eu_consent_links(self) -> None:
+        from core.tldreview_tool import resolve_short_url
+
+        consent_url = (
+            "https://consent.google.com/m?continue=https%3A%2F%2Fwww.google.com"
+            "%2Fmaps%2Fplace%2FTest%2Fdata%3D!3m1!1s0x3442abb6da9c9e1f%3A0x123456789abcdef0"
+        )
+        resolved = resolve_short_url(consent_url)
+        self.assertEqual(
+            resolved,
+            "https://www.google.com/maps/place/Test/data=!3m1!1s0x3442abb6da9c9e1f:0x123456789abcdef0",
+        )
+
+    def test_http_get_json_retries_on_transient_error(self) -> None:
+        import io
+        import urllib.error
+        from core.tldreview_tool import http_get_json
+
+        class DummyResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self) -> bytes:
+                return b'{"ok": true}'
+
+        http_503 = urllib.error.HTTPError(
+            url="https://serpapi.com/search.json?api_key=my_secret_key",
+            code=503,
+            msg="Service Unavailable",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(b"temporary overload"),
+        )
+
+        with patch("urllib.request.urlopen", side_effect=[http_503, DummyResp()]) as mock_open, patch(
+            "time.sleep"
+        ):
+            data = http_get_json("https://serpapi.com/search.json", {"api_key": "my_secret_key"})
+            self.assertEqual(data, {"ok": True})
+            self.assertEqual(mock_open.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

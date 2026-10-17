@@ -21,3 +21,9 @@ Thumbs.db
 venv/
 .venv/
 env/
+
+# Packaging & Cache
+build/
+dist/
+*.egg-info/
+.cache/

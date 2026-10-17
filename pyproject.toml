@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tldreview"
+version = "0.2.0"
+description = "Turn messy Google Maps reviews into actionable, anti-hallucination intelligence for any AI Agent."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [
+    { name = "TL;DReview Contributors" }
+]
+keywords = ["google-maps", "reviews", "ai-agent", "mcp", "langchain", "serpapi", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Core engine is strictly zero-dependency (Python 3 standard library only)
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+langchain = ["langchain-core>=0.1.0"]
+all = ["mcp>=1.0.0", "langchain-core>=0.1.0"]
+
+[project.urls]
+Homepage = "https://tldreview.app/"
+Repository = "https://github.com/dryden/TLDReview"
+Issues = "https://github.com/dryden/TLDReview/issues"
+
+[project.scripts]
+tldreview = "core.tldreview_tool:main"
+tldreview-mcp = "integrations.mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "integrations*"]

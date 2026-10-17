@@ -145,16 +145,26 @@ class PlaceInfo:
 # ---------------------------------------------------------------------------
 # Step 1: URL & ID Extraction (Ports of app/utils.py & handlers.py)
 # ---------------------------------------------------------------------------
+def _unwrap_consent_url(url: str) -> str:
+    """Unwrap Google EU/regional consent redirect URLs (?continue=...)."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc.lower().startswith("consent."):
+        cont = urllib.parse.parse_qs(parsed.query).get("continue")
+        if cont and cont[0]:
+            return urllib.parse.unquote(cont[0]).strip()
+    return url
+
+
 def extract_google_maps_url(text: str) -> Optional[str]:
     """Extract a Google Maps URL from free-form text or link wrappers."""
     for match in _URL_RE.finditer(text):
-        candidate = match.group(0).rstrip(").,;'\"!?]>）！？，。、】》」』")
+        candidate = _unwrap_consent_url(match.group(0).rstrip(").,;'\"!?]>）！？，。、】》」』"))
         # Handle Instagram redirect wrapper: l.instagram.com/?u=...
         host = urllib.parse.urlparse(candidate).netloc.lower()
         if host.endswith("instagram.com"):
             query_params = urllib.parse.parse_qs(urllib.parse.urlparse(candidate).query)
             for target in query_params.get("u", []):
-                decoded = urllib.parse.unquote(target).strip()
+                decoded = _unwrap_consent_url(urllib.parse.unquote(target).strip())
                 if is_google_maps_url(decoded):
                     return decoded
 
@@ -182,31 +192,30 @@ def is_google_maps_url(url: str) -> bool:
     return parsed.path.startswith("/maps") or "maps" in parsed.path
 
 
-def resolve_short_url(url: str) -> str:
+def resolve_short_url(url: str, timeout: float = 10.0) -> str:
     """Follow HTTP redirect chains for short links and unwrap Google consent pages."""
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower()
-    if not any(h in host for h in ("goo.gl", "share.google")):
-        return url
+    current_url = _unwrap_consent_url(url)
+    for _ in range(2):
+        parsed = urllib.parse.urlparse(current_url)
+        host = parsed.netloc.lower()
+        if not any(h in host for h in ("goo.gl", "share.google")):
+            break
 
-    log(f"Resolving short URL: {url}")
-    current_url = url
-    try:
-        # Custom redirect handler that doesn't lose location header
-        req = urllib.request.Request(current_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            current_url = resp.geturl()
-    except urllib.error.HTTPError as exc:
-        current_url = exc.geturl() or current_url
-    except Exception as exc:
-        log(f"URL resolve warning: {exc}")
+        log(f"Resolving short URL: {current_url}")
+        try:
+            req = urllib.request.Request(current_url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resolved = resp.geturl() or current_url
+        except urllib.error.HTTPError as exc:
+            resolved = exc.geturl() or current_url
+        except Exception as exc:
+            log(f"URL resolve warning: {exc}")
+            break
 
-    # Handle EU consent redirect: consent.google.com/...?continue=<target>
-    parsed_final = urllib.parse.urlparse(current_url)
-    if parsed_final.netloc.startswith("consent."):
-        cont = urllib.parse.parse_qs(parsed_final.query).get("continue")
-        if cont:
-            current_url = cont[0]
+        next_url = _unwrap_consent_url(resolved)
+        if next_url == current_url:
+            break
+        current_url = next_url
 
     return current_url
 
@@ -311,25 +320,42 @@ def infer_language(address: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 # Step 2: SerpApi Integration (Zero external dependencies)
 # ---------------------------------------------------------------------------
-def http_get_json(url: str, params: dict[str, Any]) -> dict:
-    """Perform HTTP GET request and return JSON object."""
+_TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
+
+
+def http_get_json(url: str, params: dict[str, Any], max_retries: int = 2) -> dict:
+    """Perform HTTP GET request with transient retry and return JSON object."""
     api_key = str(params.get("api_key") or "")
     qs = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     full_url = f"{url}?{qs}"
-    req = urllib.request.Request(
-        full_url,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            data = resp.read().decode("utf-8", "replace")
-            return json.loads(data)
-    except urllib.error.HTTPError as exc:
-        body = _redact_api_key(exc.read().decode("utf-8", "replace"), api_key)
-        raise RuntimeError(f"SerpApi HTTP {exc.code}: {body}") from None
-    except Exception as exc:
-        safe_msg = _redact_api_key(str(exc), api_key)
-        raise RuntimeError(f"Network request to SerpApi failed: {safe_msg}") from None
+
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(
+            full_url,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                data = resp.read().decode("utf-8", "replace")
+                return json.loads(data)
+        except urllib.error.HTTPError as exc:
+            body = _redact_api_key(exc.read().decode("utf-8", "replace"), api_key)
+            if exc.code in _TRANSIENT_HTTP_CODES and attempt < max_retries:
+                delay = 0.5 * (2 ** attempt)
+                log(f"SerpApi HTTP {exc.code} (transient), retrying in {delay:.1f}s...")
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"SerpApi HTTP {exc.code}: {body}") from None
+        except Exception as exc:
+            safe_msg = _redact_api_key(str(exc), api_key)
+            if attempt < max_retries:
+                delay = 0.5 * (2 ** attempt)
+                log(f"Network glitch ({safe_msg}), retrying in {delay:.1f}s...")
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Network request to SerpApi failed: {safe_msg}") from None
+
+    raise RuntimeError("Network request to SerpApi exhausted retries")
 
 
 def place_lookup_params(data_id: str) -> Optional[dict[str, str]]:

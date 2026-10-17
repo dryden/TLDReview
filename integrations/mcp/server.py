@@ -47,5 +47,24 @@ def summarize_google_maps_reviews(url: str, lang: str = "zh-TW") -> str:
 
     return format_markdown_output(result, include_agent_instructions=True)
 
-if __name__ == "__main__":
+
+@mcp.prompt()
+def tldreview_analysis_prompt(lang: str = "zh-TW") -> str:
+    """Load the official TL;DReview anti-hallucination system prompt template."""
+    prompt_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../prompts"))
+    filename = "SYSTEM_PROMPT_EN.md" if lang.lower().startswith("en") else "SYSTEM_PROMPT.md"
+    prompt_path = os.path.join(prompt_dir, filename)
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return "Analyze the Google Maps reviews strictly based on evidence without hallucination."
+
+
+def main() -> None:
+    """Entrypoint for tldreview-mcp CLI command."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

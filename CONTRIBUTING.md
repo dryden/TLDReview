@@ -20,5 +20,9 @@
 
 ---
 
-## 核心規則
+## 核心規則與測試
 - `core/tldreview_tool.py` 必須保持 **Zero Dependencies**（僅使用 Python 3 標準庫），以便隨時能在無網際網路安裝套件的極簡沙盒中直接運作。
+- 提交 PR 前請確保通過所有零依賴單元測試：
+  ```bash
+  python3 -m unittest discover -s tests -v
+  ```
