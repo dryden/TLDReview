@@ -743,40 +743,68 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
     """Format pipeline result into a structured Markdown digest for CLI, MCP, and LangChain."""
     p = result.get("place") or {}
     s = result.get("stats") or {}
+    target_lang = str(s.get("preferred_summary_language") or "en")
+    is_zh = target_lang.lower().startswith("zh")
+
     avg_rating = p.get("average_rating")
-    rating_str = f"⭐ {avg_rating:.1f}" if avg_rating is not None else "⭐ 暫無評分"
+    if is_zh:
+        rating_str = f"⭐ {avg_rating:.1f}" if avg_rating is not None else "⭐ 暫無評分"
+    else:
+        rating_str = f"⭐ {avg_rating:.1f}" if avg_rating is not None else "⭐ N/A"
 
     lines = [f"# {p.get('name') or 'Google Maps Place'}"]
     if p.get("address"):
-        lines.append(f"📍 地址: {p['address']}")
-    lines.append(f"🏷️ 分類: {p.get('type') or 'unknown'} | {rating_str} (總評數: {p.get('total_reviews') or 0})")
+        lines.append(f"📍 {'地址' if is_zh else 'Address'}: {p['address']}")
+    if is_zh:
+        lines.append(f"🏷️ 分類: {p.get('type') or 'unknown'} | {rating_str} (總評數: {p.get('total_reviews') or 0})")
+    else:
+        lines.append(f"🏷️ Category: {p.get('type') or 'unknown'} | {rating_str} (Total reviews: {p.get('total_reviews') or 0})")
 
     rs = p.get("rating_summary") or {}
     if rs:
         dist_parts = [f"{star}★({rs[str(star)]})" for star in (5, 4, 3, 2, 1) if str(star) in rs]
         if dist_parts:
-            lines.append(f"📈 星級分布: {' | '.join(dist_parts)}")
+            label = "星級分布" if is_zh else "Rating Distribution"
+            lines.append(f"📈 {label}: {' | '.join(dist_parts)}")
 
     sort_label = s.get("sort_by") or "qualityScore"
-    lines.append(
-        f"📊 評論抽樣: 採集 {s.get('used_reviews') or 0} 則關鍵評論 "
-        f"(來源語系: {s.get('fetch_language') or 'en'} | 排序: {sort_label})\n"
-    )
-    lines.append("## 精選評論清單 (Evidence Data)")
+    if is_zh:
+        lines.append(
+            f"📊 評論抽樣: 採集 {s.get('used_reviews') or 0} 則關鍵評論 "
+            f"(來源語系: {s.get('fetch_language') or 'en'} | 排序: {sort_label})\n"
+        )
+        lines.append("## 精選評論清單 (Evidence Data)")
+    else:
+        lines.append(
+            f"📊 Review Sample: {s.get('used_reviews') or 0} curated reviews "
+            f"(Source language: {s.get('fetch_language') or 'en'} | Sort: {sort_label})\n"
+        )
+        lines.append("## Curated Reviews (Evidence Data)")
     lines.append(result.get("formatted_reviews") or "")
 
     if include_agent_instructions:
-        target_lang = s.get("preferred_summary_language") or "zh-TW"
-        lines.extend([
-            "",
-            "---",
-            f"## 🦊 TL;DReview 分析與排版規範 (請以 `{target_lang}` 輸出)",
-            "請嚴格根據上方精選評論證據（Evidence Data）產出結構化報告：",
-            "1. **嚴禁幻覺（Anti-Hallucination）**：所有優缺點、招牌菜色、消費規則必須 100% 來自上述評論，未提及的維度請直接整段省略。",
-            "2. **評分操縱示警**：若評論提及「五星好評送飲料/小菜/折價」等刷評活動，或星級呈極端 M 型分布，請務必於「💡 營運洞察與消費規則」明確示警。",
-            "3. **兩極評價標註**：若同一項目評價分歧，請標註「（評價兩極）」並平實呈現雙方觀點。",
-            "4. **7 大標準維度**：🍜 必點招牌 / 核心亮點、👍 優勢與推薦點、👎 缺點與避雷提醒、💡 營運洞察與消費規則、🤫 內行人的秘密撇步、🚗 交通與停車指南、🚨 特別點名。",
-        ])
+        if is_zh:
+            lines.extend([
+                "",
+                "---",
+                f"## 🦊 TL;DReview 分析與排版規範 (請以 `{target_lang}` 輸出)",
+                "請嚴格根據上方精選評論證據（Evidence Data）產出結構化報告：",
+                "1. **嚴禁幻覺（Anti-Hallucination）**：所有優缺點、招牌菜色、消費規則必須 100% 來自上述評論，未提及的維度請直接整段省略。",
+                "2. **評分操縱示警**：若評論提及「五星好評送飲料/小菜/折價」等刷評活動，或星級呈極端 M 型分布，請務必於「💡 營運洞察與消費規則」明確示警。",
+                "3. **兩極評價標註**：若同一項目評價分歧，請標註「（評價兩極）」並平實呈現雙方觀點。",
+                "4. **7 大標準維度**：🍜 必點招牌 / 核心亮點、👍 優勢與推薦點、👎 缺點與避雷提醒、💡 營運洞察與消費規則、🤫 內行人的秘密撇步、🚗 交通與停車指南、🚨 特別點名。",
+            ])
+        else:
+            lines.extend([
+                "",
+                "---",
+                f"## 🦊 TL;DReview Analysis & Formatting Guidelines (Output in `{target_lang}`)",
+                "Synthesize a structured intelligence briefing strictly grounded in the Evidence Data above:",
+                "1. **Anti-Hallucination**: Every dish, pro, con, or rule MUST be 100% backed by the reviews above. Omit any section that has no direct evidence.",
+                "2. **Rating Manipulation Radar**: If reviews mention '5-star review/check-in for freebies/discounts' or show an extreme bimodal rating distribution, explicitly warn the user under '💡 Operational Insights & Rules'.",
+                "3. **Conflicting Feedback**: When opinions diverge sharply on an item, label it `(Mixed feedback)` and present both sides objectively.",
+                "4. **7 Standard Sections**: 🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts.",
+            ])
 
     return "\n".join(lines)
 

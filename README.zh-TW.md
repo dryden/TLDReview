@@ -103,7 +103,7 @@ graph TD
     Core --> ShortURL[短網址解析 & CID 提取]
     Core --> SerpApi[SerpApi 抓取最新與高權重評論]
     Core --> Filter[評論篩選、防爆 Token 密度壓縮]
-    Filter --> Prompt[prompts/SYSTEM_PROMPT.md]
+    Filter --> Prompt[prompts/SYSTEM_PROMPT.zh-TW.md]
     Prompt --> Output[🦊 深度避雷與推薦報告]
 ```
 
@@ -126,10 +126,10 @@ TL;DReview 透過 [SerpApi](https://serpapi.com/) 抓取 Google Maps 評論，�
 
 | 平台 / Agent | 整合方式 | 特色 | 指南連結 |
 | :--- | :--- | :--- | :--- |
-| **xAI Grok Bot** | Cloud Computer 附件 | 具備持久化沙盒、Secret 密鑰保護 | [👉 Grok 串接指南](integrations/grok/) |
-| **Meta Muse** | Linux VM 沙盒 | 具備 Sentinel 安全連線提示 | [👉 Muse 串接指南](integrations/muse/) |
-| **Claude / Cursor** | Model Context Protocol (MCP) | 一鍵掛載至本機 Claude Desktop / IDE | [👉 MCP 串接指南](integrations/mcp/) |
-| **LangChain / CrewAI** | Python `@tool` 裝飾器 | 快速納入 Multi-Agent 鏈路 | [👉 LangChain 指南](integrations/langchain/) |
+| **xAI Grok Bot** | Cloud Computer 附件 | 具備持久化沙盒、Secret 密鑰保護 | [👉 Grok 串接指南](integrations/grok/README.zh-TW.md) |
+| **Meta Muse** | Linux VM 沙盒 | 具備 Sentinel 安全連線提示 | [👉 Muse 串接指南](integrations/muse/README.zh-TW.md) |
+| **Claude / Cursor** | Model Context Protocol (MCP) | 一鍵掛載至本機 Claude Desktop / IDE | [👉 MCP 串接指南](integrations/mcp/README.zh-TW.md) |
+| **LangChain / CrewAI** | Python `@tool` 裝飾器 | 快速納入 Multi-Agent 鏈路 | [👉 LangChain 指南](integrations/langchain/README.zh-TW.md) |
 | **CLI / 本機終端** | 直接執行獨立腳本 | 支援 Markdown 與 JSON 輸出 | [👉 Core CLI 指南](#️-本機獨立執行-cli) |
 
 ---
@@ -170,7 +170,7 @@ TL;DReview 透過 [SerpApi](https://serpapi.com/) 抓取 Google Maps 評論，�
 ・老闆娘點餐步調緊湊，入座前建議先確認好麵型，避免猶豫被催促。
 ```
 
-*(更多範例請參閱 [examples/sample_report.md](examples/sample_report.md))*
+*(更多範例請參閱 [examples/sample_report.zh-TW.md](examples/sample_report.zh-TW.md))*
 
 ---
 
@@ -199,7 +199,7 @@ tldreview "https://maps.app.goo.gl/sample" --markdown
 ## 🤝 擴充與貢獻
 
 想為其他 Agent（如 OpenAI Custom GPTs、Discord Bot、Telegram Bot 等）建立 Adapter？  
-歡迎閱讀 [CONTRIBUTING.md](CONTRIBUTING.md) 提交 PR！
+歡迎閱讀 [CONTRIBUTING.zh-TW.md](CONTRIBUTING.zh-TW.md) 提交 PR！
 
 ---
 

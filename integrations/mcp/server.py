@@ -62,10 +62,10 @@ def summarize_google_maps_reviews(
 
 
 @mcp.prompt()
-def tldreview_analysis_prompt(lang: str = "zh-TW") -> str:
+def tldreview_analysis_prompt(lang: str = "en") -> str:
     """Load the official TL;DReview anti-hallucination system prompt template."""
     prompt_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../prompts"))
-    filename = "SYSTEM_PROMPT_EN.md" if lang.lower().startswith("en") else "SYSTEM_PROMPT.md"
+    filename = "SYSTEM_PROMPT.zh-TW.md" if lang.lower().startswith("zh") else "SYSTEM_PROMPT.md"
     prompt_path = os.path.join(prompt_dir, filename)
     try:
         with open(prompt_path, "r", encoding="utf-8") as f:

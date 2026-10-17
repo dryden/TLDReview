@@ -174,15 +174,19 @@ class TestTLDReviewCore(unittest.TestCase):
             self.assertEqual(res1["stats"]["fetch_language"], "zh-tw+en")
             self.assertEqual(mock_reviews.call_count, 2)
 
+            md_zh = format_markdown_output(res1, include_agent_instructions=True)
+            self.assertIn("📈 星級分布: 5★(100) | 1★(20)", md_zh)
+            self.assertIn("TL;DReview 分析與排版規範", md_zh)
+
             # Second call with a DIFFERENT preferred_lang ("en") should hit the same cache
             res2 = run_pipeline(url, api_key="dummy_key", preferred_lang="en", use_cache=True)
             self.assertTrue(res2.get("cached"))
             self.assertEqual(res2["stats"]["preferred_summary_language"], "en")
             self.assertEqual(mock_details.call_count, 1)
 
-            md = format_markdown_output(res2, include_agent_instructions=True)
-            self.assertIn("📈 星級分布: 5★(100) | 1★(20)", md)
-            self.assertIn("TL;DReview 分析與排版規範", md)
+            md_en = format_markdown_output(res2, include_agent_instructions=True)
+            self.assertIn("📈 Rating Distribution: 5★(100) | 1★(20)", md_en)
+            self.assertIn("TL;DReview Analysis & Formatting Guidelines", md_en)
 
     def test_resolve_short_url_unwraps_eu_consent_links(self) -> None:
         from core.tldreview_tool import resolve_short_url

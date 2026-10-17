@@ -1,39 +1,41 @@
-# 範例輸出：TL;DReview 深度報告
+# Sample Output: TL;DReview Digest Report
 
-以台北市某人氣牛肉麵為例，TL;DReview 輸出報告如下：
+**English** | **[繁體中文](sample_report.zh-TW.md)**
 
----
-
-🦊 **TL;DReview 深度報告：老張家常牛肉麵**  
-📍 地址：台北市大安區新生南路一段  
-🏷️ 類型：麵食餐廳｜⭐ 4.3（共 1,820 則評價，分析 24 則核心評論）
+Below is a sample TL;DReview output report for a popular beef noodle shop in Taipei:
 
 ---
 
-🍜 **必點招牌 / 核心亮點**
-・**紅燒半筋半肉麵**：牛筋燉至軟嫩化口，牛腱肉厚切入味，湯頭帶有淡淡中藥與牛骨甘甜（共識度極高）。
-・**花椒自製辣牛油**：桌上的牛油辣醬香氣濃郁，加半匙能讓湯頭層次翻倍。
+🦊 **TL;DReview Digest: Lao Zhang Beef Noodle House**  
+📍 Address: Sec. 1, Xinsheng S. Rd, Da'an District, Taipei City  
+🏷️ Type: Noodle Shop | ⭐ 4.3 (Total: 1,820 reviews, Analyzed: 24 key reviews)
 
-👍 **優勢與推薦點**
-・出餐效率極高，即便客滿點餐後 5 分鐘內即上桌。
-・小菜區選擇多樣，涼拌小黃瓜酸脆開胃、滷豆干入味。
+---
 
-👎 **缺點與避雷提醒**
-・湯頭整體偏重鹹濃郁，平時口味清淡者建議先點「淡湯」或主動加高湯。
-・室內冷氣偏弱，夏天尖峰時段用餐容易悶熱流汗。
+🍜 **Must-Try / Core Highlights**
+- **Braised Half-Tendon Half-Beef Noodles**: Tendon is braised until melt-in-your-mouth tender, beef shank is thick-cut and flavorful, and the broth carries a subtle herbal-beef sweetness (strong consensus).
+- **House Sichuan Pepper Spicy Beef Tallow**: Rich, aromatic condiment on the table—adding half a spoonful doubles the depth of the broth.
 
-💡 **營運洞察與消費規則**
-・僅收現金，不支援行動支付或信用卡。
-・內用每人低消為一碗麵或滿 150 元。
-・未發現刷星贈品現象，評分真實度高。
+👍 **Strengths & Pros**
+- Extremely fast service; bowls arrive within 5 minutes of ordering even when the shop is packed.
+- Great side dish selection—the marinated cucumber is crisp and refreshing, and the braised dried tofu is well-seasoned.
 
-🤫 **內行人的秘密撇步**
-・店面中午 11:30 開門，建議 11:45 前或 13:30 後前往，免排隊超過 15 分鐘。
-・熟客吃法：點粗麵（家常麵），比細麵更能掛住牛油香氣。
+👎 **Weaknesses & Red Flags**
+- Broth leans salty and heavy overall; diners who prefer lighter flavors should ask for the "light broth" option or add clear soup.
+- Indoor air conditioning is weak, making it warm and stuffy during peak summer hours.
 
-🚗 **交通與停車指南**
-・捷運大安森林公園站 1 號出口步行約 6 分鐘。
-・巷弄狹窄無停車格，開車建議停至建國南路高架橋下停車場。
+💡 **Operational Insights & Rules**
+- Cash only; credit cards and mobile payments are not accepted.
+- Minimum dine-in spend is one bowl of noodles or NT$150 per person.
+- No signs of "5-star review for freebies" promotions; the rating is organic and reliable.
 
-🚨 **特別點名**
-・老闆娘點餐節奏極快，點單時請先確認好麵條粗細與小菜，避免猶豫受白眼。
+🤫 **Insider Tips**
+- Opens at 11:30 AM—arrive before 11:45 AM or after 1:30 PM to avoid waiting more than 15 minutes in line.
+- Regulars' hack: order the wide hand-cut noodles instead of thin noodles—they hold the spicy beef tallow aroma much better.
+
+🚗 **Transit & Parking**
+- About a 6-minute walk from MRT Daan Park Station (Exit 1).
+- Narrow alley with no street parking; drivers should park at the public lot under the Jianguo S. Road Elevated Highway.
+
+🚨 **Notable Callouts**
+- The owner takes orders at a very brisk pace—decide on your noodle width and side dishes before ordering to avoid feeling rushed.

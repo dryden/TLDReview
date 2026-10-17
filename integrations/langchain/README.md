@@ -1,11 +1,13 @@
-# 🦜🔗 LangChain & CrewAI 整合指南
+# 🦜🔗 LangChain & CrewAI Integration Guide
 
-本模組提供一鍵包裝好的 `@tool`，可直接傳入 LangChain Agent 或 CrewAI Agent。
+**English** | **[繁體中文](README.zh-TW.md)**
+
+This module provides a pre-wrapped `@tool` ready to be passed directly into a LangChain or CrewAI Agent.
 
 ```python
 import os
 from integrations.langchain.tool import tldreview_maps_tool
 
-# 直接加入 Agent 的 tools 清單
+# Add directly to your Agent's tools list
 tools = [tldreview_maps_tool]
 ```

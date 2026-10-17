@@ -1,28 +1,30 @@
-# Contributing to TLDReview
+# Contributing to TL;DReview
 
-歡迎為 TLDReview 提供貢獻！無論是回報 Bug、改善核心清洗演算法，或是新增其他 AI Agent 的適配層（Adapter），我們都非常歡迎。
+**English** | **[繁體中文](CONTRIBUTING.zh-TW.md)**
 
----
-
-## 擴充新的 Agent 整合（Adding a New Agent Adapter）
-
-若你想新增某個 AI Agent（例如 Coze、Dify、OpenAI Actions、Discord Bot、Telegram Bot 等）：
-
-1. 在 `integrations/` 下建立新的子目錄，例如 `integrations/my_agent/`。
-2. 包含以下兩個核心檔案：
-   - `README.md`：該平台的操作指引與金鑰管理說明。
-   - `setup_prompt.md` 或 `adapter.py`：啟動 Prompt 或程式碼橋接器。
-3. 確保你的 Agent 調用邏輯符合 `prompts/SYSTEM_PROMPT.md` 所規範的分析標準：
-   - 嚴格反幻覺（Anti-hallucination）
-   - 識別評分操縱（五星送贈品）
-   - 結構化 7 大區塊排版
-4. 發起 Pull Request！
+Contributions to TL;DReview are welcome! Whether you are reporting a bug, improving the review curation algorithm, or adding an adapter for a new AI Agent platform, we'd love your help.
 
 ---
 
-## 核心規則與測試
-- `core/tldreview_tool.py` 必須保持 **Zero Dependencies**（僅使用 Python 3 標準庫），以便隨時能在無網際網路安裝套件的極簡沙盒中直接運作。
-- 提交 PR 前請確保通過所有零依賴單元測試：
+## Adding a New Agent Adapter
+
+If you'd like to add support for a new AI Agent or platform (e.g., Coze, Dify, OpenAI Custom GPT Actions, Discord Bot, Telegram Bot, etc.):
+
+1. Create a new subdirectory under `integrations/`, e.g., `integrations/my_agent/`.
+2. Include the following core files:
+   - `README.md`: Setup instructions and API key / secret configuration for that platform.
+   - `setup_prompt.md` or `adapter.py`: The bootstrap prompt or code bridge.
+3. Ensure your agent integration adheres to the analysis standards in [`prompts/SYSTEM_PROMPT_EN.md`](prompts/SYSTEM_PROMPT_EN.md) (and [`prompts/SYSTEM_PROMPT.md`](prompts/SYSTEM_PROMPT.md)):
+   - Strict Anti-Hallucination (100% evidence-bound)
+   - Rating Manipulation Detection (flagging 5-star check-in freebies)
+   - Structured 7-Section Report Formatting
+4. Open a Pull Request!
+
+---
+
+## Core Rules & Testing
+- `core/tldreview_tool.py` **must remain Zero Dependencies** (Python 3 standard library only) so it can run immediately inside restricted cloud sandboxes without internet package installation.
+- Run the zero-dependency unit test suite before submitting a PR:
   ```bash
   python3 -m unittest discover -s tests -v
   ```

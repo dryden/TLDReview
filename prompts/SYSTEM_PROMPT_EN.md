@@ -1,5 +1,7 @@
 # TL;DReview Master System Prompt (English)
 
+**English** | **[繁體中文](SYSTEM_PROMPT.md)**
+
 This system prompt defines the core reasoning framework and analysis guidelines of TL;DReview for any LLM / AI Agent.
 
 ---
