@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """TL;DReview - Google Maps Review Extraction & Curation Tool.
 
+Official Website: https://tldreview.app/
+
 A zero-dependency standalone tool designed for agent sandboxes, including
 Meta Muse and Grok Bot cloud computers.
 Extracts Google Maps URLs, resolves redirects, grabs reviews via SerpApi,

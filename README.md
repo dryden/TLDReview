@@ -5,6 +5,9 @@
 **Turn messy Google Maps reviews into actionable, anti-hallucination intelligence for any AI Agent.**  
 *一鍵將雜亂冗長的 Google Maps 評論，提煉成極具避雷價值與洞察深度的結構化報告。*
 
+🌐 **[專案官網 (Official Website)](https://tldreview.app/)**
+
+[![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
@@ -16,7 +19,7 @@
 
 ## 🦊 TL;DReview 是什麼？
 
-**TL;DReview** 是一個專為 AI Agent 與個人助手設計的評論分析工具。貼上 Google Maps 網址，它就會從數百則又長又雜的評論中，整理出一份結構化報告：**必點招牌、優點、缺點與避雷、內行人祕笈、營運規則、交通停車**，讓你在出發前就掌握一個地點的完整細節。
+**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。貼上 Google Maps 網址，它就會從數百則又長又雜的評論中，整理出一份結構化報告：**必點招牌、優點、缺點與避雷、內行人祕笈、營運規則、交通停車**，讓你在出發前就掌握一個地點的完整細節。
 
 ---
 
