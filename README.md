@@ -14,6 +14,18 @@
 
 ---
 
+## ❓ Google Maps 已經有評論摘要了，為什麼還需要 TL;DReview？
+
+Google Maps 的評論摘要最多只有三行，看完之後往往還是得回頭翻完整評論。
+
+**TL;DReview** 會從眾多評論中過濾、整理出該地點的**優點、缺點、內行人祕笈**等分類內容，讓你快速掌握一間店的完整細節。
+
+你還可以：
+- 💬 **隨時追問 AI**：AI 會從評論中找出相關資料來回覆你。
+- 🎛️ **自訂輸出分類**：直接請 AI 調整未來每次報告的內容分類方式，打造最貼近你需求的客製化體驗。
+
+---
+
 ## 💡 為什麼需要 TL;DReview？
 
 去餐廳、咖啡廳或熱門景點時，Google Maps 的星級常常被「五星打卡送小菜/折價券」灌水；數百則評論又長又雜，根本看不完。
@@ -49,7 +61,7 @@ graph TD
 | **Meta Muse** | Linux VM 沙盒 | 具備 Sentinel 安全連線提示 | [👉 Muse 串接指南](integrations/muse/) |
 | **Claude / Cursor** | Model Context Protocol (MCP) | 一鍵掛載至本機 Claude Desktop / IDE | [👉 MCP 串接指南](integrations/mcp/) |
 | **LangChain / CrewAI** | Python `@tool` 裝飾器 | 快速納入 Multi-Agent 鏈路 | [👉 LangChain 指南](integrations/langchain/) |
-| **CLI / 本機終端** | 直接執行獨立腳本 | 支援 Markdown 與 JSON 輸出 | [👉 Core CLI 指南](core/) |
+| **CLI / 本機終端** | 直接執行獨立腳本 | 支援 Markdown 與 JSON 輸出 | [👉 Core CLI 指南](#️-本機獨立執行-cli) |
 
 ---
 

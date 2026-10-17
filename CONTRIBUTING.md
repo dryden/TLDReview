@@ -15,7 +15,7 @@
 3. 確保你的 Agent 調用邏輯符合 `prompts/SYSTEM_PROMPT.md` 所規範的分析標準：
    - 嚴格反幻覺（Anti-hallucination）
    - 識別評分操縱（五星送贈品）
-   - 結構化 6 大維度排版
+   - 結構化 7 大區塊排版
 4. 發起 Pull Request！
 
 ---

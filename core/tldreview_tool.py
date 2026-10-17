@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Iterable, List, Optional, Tuple
 import urllib.error
 import urllib.parse
@@ -101,9 +102,13 @@ class Review:
         if not self.published_at:
             return None
         try:
-            return datetime.fromisoformat(self.published_at)
+            dt = datetime.fromisoformat(self.published_at)
         except ValueError:
             return None
+        # Normalize naive datetimes to UTC so comparisons with aware cutoffs don't raise
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
 
 @dataclass
@@ -116,6 +121,8 @@ class PlaceInfo:
     rating_summary: dict[str, int] = field(default_factory=dict)
     average_rating: Optional[float] = None
     total_reviews: Optional[int] = None
+    data_id: Optional[str] = None   # 0x...:0x... form returned by SerpApi
+    place_id: Optional[str] = None  # ChI... form returned by SerpApi
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +278,12 @@ def infer_language(address: Optional[str]) -> str:
         if len(tok) == 2 and tok.isascii() and tok.upper() in COUNTRY_LANG:
             return COUNTRY_LANG[tok.upper()]
         for name, cc in COUNTRY_NAMES.items():
-            if tok == name or tok.startswith(name) or name in tok:
+            if name.isascii():
+                # Word-boundary match so e.g. "uk" doesn't match "fukuoka"
+                matched = re.search(rf"\b{re.escape(name)}\b", tok) is not None
+            else:
+                matched = name in tok
+            if matched:
                 return COUNTRY_LANG.get(cc, "en")
     for name, cc in COUNTRY_NAMES.items():
         if not name.isascii() and name in address:
@@ -301,14 +313,44 @@ def http_get_json(url: str, params: dict[str, Any]) -> dict:
         raise RuntimeError(f"Network request to SerpApi failed: {exc}") from exc
 
 
+def place_lookup_params(data_id: str) -> Optional[dict[str, str]]:
+    """Map an extracted identifier to the SerpApi google_maps place-lookup parameter.
+
+    SerpApi's `data_cid` expects a *decimal* CID. For a `0x<a>:0x<b>` data_id,
+    the decimal CID is int(<b>, 16).
+    """
+    if _CID_RE.fullmatch(data_id):
+        return {"data_cid": str(int(data_id.split(":")[1], 16))}
+    if data_id.isdigit():
+        return {"data_cid": data_id}
+    if data_id.startswith("ChI"):
+        return {"place_id": data_id}
+    return None
+
+
+def is_reviews_ready_id(data_id: str) -> bool:
+    """True if the identifier is directly accepted by the google_maps_reviews engine."""
+    return bool(_CID_RE.fullmatch(data_id) or data_id.startswith("ChI"))
+
+
+def reviews_lookup_params(data_id: str) -> dict[str, str]:
+    """Map an identifier to the google_maps_reviews parameter (place_id or data_id)."""
+    if data_id.startswith("ChI"):
+        return {"place_id": data_id}
+    return {"data_id": data_id}
+
+
 def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
     """Fetch place details (name, address, rating distribution, types) via SerpApi."""
-    params = {
+    lookup = place_lookup_params(data_id)
+    if not lookup:
+        log(f"Place details skipped: unsupported identifier format '{data_id}'")
+        return PlaceInfo()
+    params: dict[str, Any] = {
         "api_key": api_key,
         "engine": "google_maps",
-        "type": "place",
-        "data_cid": data_id,
         "output": "json",
+        **lookup,
     }
     try:
         payload = http_get_json(SERPAPI_ENDPOINT, params)
@@ -345,7 +387,10 @@ def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
     elif isinstance(rs_raw, list):
         for b in rs_raw:
             if isinstance(b, dict):
-                rating_summary[str(b.get("stars", ""))] = int(b.get("amount", 0))
+                try:
+                    rating_summary[str(b.get("stars", ""))] = int(b.get("amount") or 0)
+                except (ValueError, TypeError):
+                    continue
 
     avg_rating = core.get("rating")
     try:
@@ -368,6 +413,8 @@ def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
         rating_summary=rating_summary,
         average_rating=avg_rating,
         total_reviews=total_reviews,
+        data_id=core.get("data_id"),
+        place_id=core.get("place_id"),
     )
 
 
@@ -435,12 +482,13 @@ def fetch_serpapi_reviews(
     page_token: Optional[str] = None
 ) -> Tuple[list[Review], Optional[int], Optional[str], dict]:
     """Fetch reviews from SerpApi google_maps_reviews engine."""
-    params = {
+    lookup = reviews_lookup_params(data_id)
+    params: dict[str, Any] = {
         "api_key": api_key,
         "engine": "google_maps_reviews",
-        "data_id": data_id,
         "hl": lang,
-        "sort_by": "most_relevant",
+        "sort_by": "qualityScore",  # SerpApi value for "most relevant"
+        **lookup,
     }
     if page_token:
         params["next_page_token"] = page_token
@@ -551,7 +599,7 @@ def format_reviews_block(clipped: list[Tuple[Review, str]]) -> str:
     """Format reviews into high-density numbered lines for the LLM."""
     lines: list[str] = []
     for idx, (r, text) in enumerate(clipped, 1):
-        rating_str = f"★{r.rating:.0f}" if r.rating else ""
+        rating_str = f" ★{r.rating:.0f}" if r.rating else ""
         date_str = f" ({r.relative_time})" if r.relative_time else ""
         guide_str = " [Local Guide]" if r.is_local_guide else ""
         likes_str = f" [+{r.like_count} helpful]" if (r.like_count or 0) > 0 else ""
@@ -559,10 +607,41 @@ def format_reviews_block(clipped: list[Tuple[Review, str]]) -> str:
     return "\n".join(lines)
 
 
+CACHE_TTL_SECONDS = 24 * 60 * 60
+
+
+def _cache_path(data_id: str, preferred_lang: str) -> str:
+    base = os.getenv("TLDREVIEW_CACHE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "tldreview"
+    )
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{data_id}__{preferred_lang}")
+    return os.path.join(base, f"{safe}.json")
+
+
+def _cache_load(path: str) -> Optional[dict]:
+    try:
+        if time.time() - os.path.getmtime(path) > CACHE_TTL_SECONDS:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _cache_save(path: str, result: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+    except OSError as exc:
+        log(f"Cache write warning: {exc}")
+
+
 def run_pipeline(
     raw_input: str,
     api_key: str,
-    preferred_lang: str = "zh-TW"
+    preferred_lang: str = "zh-TW",
+    use_cache: bool = True
 ) -> dict:
     """Full execution pipeline."""
     # 1. Extract URL
@@ -584,16 +663,30 @@ def run_pipeline(
 
     log(f"Target data_id: {data_id}")
 
+    cache_file = _cache_path(data_id, preferred_lang)
+    if use_cache:
+        cached = _cache_load(cache_file)
+        if cached:
+            log("Cache hit (< 24h) - skipping SerpApi calls")
+            cached["cached"] = True
+            return cached
+
     # 4. Fetch place details for metadata & official language
     place_info = fetch_serpapi_place_details(api_key, data_id)
     official_lang = infer_language(place_info.address)
     log(f"Detected place: '{place_info.name or 'Unknown'}' in language '{official_lang}'")
 
+    # Prefer the canonical identifier returned by SerpApi for the reviews engine
+    # (e.g. URL only had a decimal CID or /g/ id).
+    review_id = data_id
+    if not is_reviews_ready_id(review_id):
+        review_id = place_info.data_id or place_info.place_id or data_id
+
     # 5. Fetch reviews in official language
     fetch_lang = official_lang
     reviews, total_count, next_token, raw_payload = fetch_serpapi_reviews(
         api_key=api_key,
-        data_id=data_id,
+        data_id=review_id,
         lang=fetch_lang
     )
 
@@ -608,7 +701,7 @@ def run_pipeline(
         try:
             more_reviews, _, _, _ = fetch_serpapi_reviews(
                 api_key=api_key,
-                data_id=data_id,
+                data_id=review_id,
                 lang=fetch_lang,
                 page_token=next_token
             )
@@ -631,12 +724,20 @@ def run_pipeline(
             log("Local Guide coverage is thin; refetching in English for international insights...")
             en_reviews, _, _, _ = fetch_serpapi_reviews(
                 api_key=api_key,
-                data_id=data_id,
+                data_id=review_id,
                 lang="en"
             )
-            if en_reviews:
-                reviews = en_reviews
-                fetch_lang = "en"
+            # Merge (instead of replacing) so local-language / page-2 reviews aren't discarded
+            seen = {(r.author, r.published_at or r.text) for r in reviews}
+            added = 0
+            for er in en_reviews:
+                key = (er.author, er.published_at or er.text)
+                if key not in seen:
+                    reviews.append(er)
+                    seen.add(key)
+                    added += 1
+            if added:
+                fetch_lang = f"{fetch_lang}+en"
         except Exception as exc:
             log(f"English refetch warning: {exc}")
 
@@ -652,7 +753,7 @@ def run_pipeline(
     curated = curate_reviews(reviews)
     clipped = clip_reviews_for_prompt(curated)
 
-    return {
+    result = {
         "status": "success",
         "data_id": data_id,
         "resolved_url": resolved_url,
@@ -685,6 +786,8 @@ def run_pipeline(
             for r, text in clipped
         ],
     }
+    _cache_save(cache_file, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +801,7 @@ def main() -> int:
     parser.add_argument("--api-key", help="SerpApi API Key (or set SERPAPI_API_KEY environment variable)")
     parser.add_argument("--lang", default="zh-TW", help="Preferred summary language code (default: zh-TW)")
     parser.add_argument("--markdown", action="store_true", help="Output high-density human/LLM-readable Markdown")
+    parser.add_argument("--no-cache", action="store_true", help="Ignore the 24h review cache and force fresh SerpApi calls")
     parser.add_argument("--parse-only", action="store_true", help="Only parse URL and data_id without calling SerpApi")
 
     args = parser.parse_args()
@@ -728,7 +832,7 @@ def main() -> int:
         return 1
 
     try:
-        result = run_pipeline(args.url, api_key, preferred_lang=args.lang)
+        result = run_pipeline(args.url, api_key, preferred_lang=args.lang, use_cache=not args.no_cache)
     except Exception as exc:
         print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stdout)
         log(f"Execution failed: {exc}")

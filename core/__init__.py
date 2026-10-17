@@ -2,7 +2,7 @@
 
 Zero-dependency Google Maps review extraction, curation, and intelligence engine.
 """
-from core.tldreview_tool import (
+from .tldreview_tool import (
     extract_google_maps_url,
     extract_maps_data_id,
     resolve_short_url,
