@@ -11,7 +11,9 @@ from core.tldreview_tool import (
     run_compare_pipeline,
     run_pipeline,
     run_top_discovery_pipeline,
+    vault_escrow_setup,
     vault_query_places,
+    vault_recover_from_passphrase,
     vault_save_place,
 )
 
@@ -144,6 +146,45 @@ def tldreview_vault_query(
             limit=limit,
             sync_key=sync_key,
         )
+        return format_vault_markdown_output(res)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@tool
+def tldreview_vault_escrow(
+    passphrase: str,
+    sync_key: Optional[str] = None,
+) -> str:
+    """Escrow the user's Sync Key to the Cloud Relay encrypted with a memorable recovery passphrase.
+
+    Follow the in-chat terminal-free flow:
+    1. First give honest disclosure: "This passphrase will remain in our chat history. Its purpose is to let you recover your vault when switching devices or after a VM reset—not to protect against someone who can read this chat. If that's okay with you, just tell me a memorable phrase right here."
+    2. Run this tool with the passphrase. When reporting success, DO NOT echo the passphrase back in chat; only provide the returned escrow_id.
+    3. Remind the user: "Next time you switch devices, just tell your new AI that exact phrase and it can restore your vault in one step."
+
+    Args:
+        passphrase: A memorable recovery passphrase (at least 10 chars or 3 words).
+        sync_key: Optional explicit sync key to escrow.
+    """
+    try:
+        res = vault_escrow_setup(passphrase=passphrase, sync_key=sync_key)
+        return format_vault_markdown_output(res)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@tool
+def tldreview_vault_recover(
+    passphrase: str,
+) -> str:
+    """Recover the user's Sync Key and restore all saved places on a new device or VM using their recovery passphrase.
+
+    Args:
+        passphrase: The memorable recovery passphrase set previously.
+    """
+    try:
+        res = vault_recover_from_passphrase(passphrase=passphrase)
         return format_vault_markdown_output(res)
     except Exception as exc:
         return f"Error: {exc}"

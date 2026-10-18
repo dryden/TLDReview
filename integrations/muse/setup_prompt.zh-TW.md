@@ -40,10 +40,15 @@ chmod +x ~/tldreview_tool.py
 5. **⚔️ 多店 PK（`--compare`）與 🗺️ 區域探索（`--top 3`）**：
    - 多店比較：`python3 ~/tldreview_tool.py "<店家A>" "<店家B>" --compare --markdown`，輸出橫向 PK 對比表。
    - 區域探索防洗分：`python3 ~/tldreview_tool.py "<類別關鍵字>" --lat <緯度> --lng <經度> --top 3 --markdown`，剔除廣告並推薦真正零刷評冠軍。
-6. **💾 個人美食金庫儲存（`--vault-save`）**：
+6. **💾 個人美食金庫儲存與復原密語（`--vault-save` ／ `--vault-escrow` ／ `--vault-recover`）**：
    - 當我說「存進想去清單 (`wishlist`)」、「吃過覺得很讚 (`liked`)」或「加入避雷 (`disliked`)」時：
      `python3 ~/tldreview_tool.py --vault-save --place-id "<id>" --name "<店名>" --status wishlist --tags "<標籤>" --must-try "<必點>" --user-notes "<筆記>" --markdown`
-   - 首次儲存時若自動產生新的 `TLDREVIEW_SYNC_KEY`（格式 `tld_...`），**請務必顯示給我並存入你的 Agent 記憶（Memory）**！
+   - **對話內密語設定流程（不使用終端機）**：當我在對話中表示要設定復原密語（例如「幫我設定同步密碼」），請依以下流程引導，全程不需要終端機：
+     1. 先說一句誠實的告知（可直接用原話）：「這句密語會留在我們的對話記錄中。它的作用是讓你換裝置或 VM 重建時能找回金庫，不是防範能看到對話的人。如果你可以接受，請直接在這裡告訴我一句好記的話。」
+     2. 我提供密語後，在背後執行 `python3 ~/tldreview_tool.py --vault-escrow --passphrase "<密語>" --markdown`；回報成功時**不要**把密語重複貼回對話中，只需給 `escrow_id`（可公開的查詢 ID）。
+     3. 成功後提醒：「之後換裝置時，只要把當初這句話再告訴新的 AI，就能一鍵復原。」（換裝置或 VM 重建時執行 `python3 ~/tldreview_tool.py --vault-recover --passphrase "<密語>" --markdown`）。
+     4. 若我對「留在對話記錄」有疑慮，提供替代方案：在自己的終端機執行 `python3 core/tldreview_tool.py --vault-escrow --passphrase "<密語>"`，密語不經過任何對話。
+   - **威脅模型（給 agent 的判斷準則）**：Agent 本來就是金庫的 custodian（必須持有 key 才能運作），復原密語是「備用鑰匙」而非「不能讓 agent 知道的秘密」。對美食 vault 而言，對話記錄是合理的備用鑰匙存放處；但此模式**不可**套用於銀行密碼等高敏感場景。
 7. **報告排版與旅遊手指卡**：
    - 嚴格根據回傳評論與元數據撰寫報告，於開頭保留 `💰 均消/價位`、`🕒 營業狀態`、`🛎️ 服務與設施` 與 `📋 最新菜單圖片`，並將 `⏳ 排隊與尖峰預警` 整合進「🤫 內行人的秘密撇步」。
    - **🗣️ 外國旅遊「點餐手指卡」**：跨語言查詢（如日/韓/泰/法文評論）時，「🍜 必點招牌 / 核心亮點」每道菜**必須保留當地語言原始菜名對照**（如 `炙燒和牛握壽司 (炙り和牛握り)`）。

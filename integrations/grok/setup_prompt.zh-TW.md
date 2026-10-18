@@ -32,9 +32,11 @@
    # 模式 E：區域探索 Top-N 防洗分掃描（--top 3，抓出附近前 3 名並推薦真正零刷評冠軍）
    python3 ~/tldreview/tldreview_tool.py "<類別或關鍵字>" --lat <緯度> --lng <經度> --top 3 --markdown
 
-   # 模式 F：E2EE 個人美食金庫（儲存與查詢口袋名單，查詢消耗 0 SerpApi 額度）
+   # 模式 F：E2EE 個人美食金庫（儲存、查詢 0 額度、復原密語託管與一鍵還原）
    python3 ~/tldreview/tldreview_tool.py --vault-save --place-id "<id>" --name "<店名>" --status wishlist --tags "<標籤>" --must-try "<必點>" --user-notes "<筆記>" --markdown
    python3 ~/tldreview/tldreview_tool.py --vault-query --status wishlist --lat <緯度> --lng <經度> --radius-km 5.0 --markdown
+   python3 ~/tldreview/tldreview_tool.py --vault-escrow --passphrase "<密語>" --markdown
+   python3 ~/tldreview/tldreview_tool.py --vault-recover --passphrase "<密語>" --markdown
    ```
 4. 若環境尚未提供密鑰，請清楚告訴我需新增 `SERPAPI_API_KEY` secret，然後停止。
 
@@ -48,9 +50,14 @@
    - 先透過你的視覺能力（Vision）從照片中辨識出**店名、分店名、地址或電話**（若照片檔案在沙盒中亦可加上 `--image <照片路徑>` 提取 EXIF GPS）。
    - 若照片有店名與地址，直接執行模式 C；若僅有店名（如連鎖店菜單或僅拍到招牌），則結合我目前的座標執行模式 B，直接進入最符合店家的評論進行分析。
 5. **⚔️ 多店比較（`--compare`）與 🗺️ 區域探索（`--top 3`）**：當我猶豫兩三間店時使用模式 D 輸出橫向對比表；當我問「附近有什麼好吃的拉麵且不踩雷？」時使用模式 E 自動剔除廣告並推薦真正零刷評冠軍。
-6. **💾 個人美食金庫儲存（`--vault-save`）**：
+6. **💾 個人美食金庫儲存與復原密語（`--vault-save` ／ `--vault-escrow` ／ `--vault-recover`）**：
    - 當我說「把這家存進想去清單 (`wishlist`)」、「這家我吃過覺得很讚 (`liked`)」或「列為避雷黑名單 (`disliked`)」時，執行 `--vault-save` 並一併帶入報告濃縮出的必點招牌、避雷點與內行撇步。
-   - 首次儲存時若工具自動產生新的 `TLDREVIEW_SYNC_KEY`（格式 `tld_...`），**請務必將該金鑰顯示給我，並存入你的 Agent 記憶（Memory）**，以便未來跨對話無縫同步！
+   - **對話內密語設定流程（不使用終端機）**：當我在對話中表示要設定復原密語（例如「幫我設定同步密碼」），請依以下流程引導，全程不需要終端機：
+     1. 先說一句誠實的告知（可直接用原話）：「這句密語會留在我們的對話記錄中。它的作用是讓你換裝置或 VM 重建時能找回金庫，不是防範能看到對話的人。如果你可以接受，請直接在這裡告訴我一句好記的話。」
+     2. 我提供密語後，在背後執行 `--vault-escrow --passphrase "<密語>"`；回報成功時**不要**把密語重複貼回對話中，只需給 `escrow_id`（可公開的查詢 ID）。
+     3. 成功後提醒：「之後換裝置時，只要把當初這句話再告訴新的 AI，就能一鍵復原。」（換裝置時執行 `--vault-recover --passphrase "<密語>"`）。
+     4. 若我對「留在對話記錄」有疑慮，提供替代方案：在自己的終端機執行 `python3 core/tldreview_tool.py --vault-escrow --passphrase "<密語>"`，密語不經過任何對話。
+   - **威脅模型（給 agent 的判斷準則）**：Agent 本來就是金庫的 custodian（必須持有 key 才能運作），復原密語是「備用鑰匙」而非「不能讓 agent 知道的秘密」。對美食 vault 而言，對話記錄是合理的備用鑰匙存放處；但此模式**不可**套用於銀行密碼等高敏感場景。
 7. **報告規範與進階防呆**：
    - 嚴格依循 TL;DReview 7 大區塊輸出報告（🍜 必點招牌、👍 優勢推薦、👎 缺點避雷、💡 營運洞察、🤫 內行撇步、🚗 交通停車、🚨 特別點名）。
    - **Digest Header 營業防呆**：開頭務必包含工具提取的 `💰 均消/價位`、`🕒 營業狀態`、`🛎️ 服務與設施` 與 `📋 最新菜單圖片`；並將 `⏳ 排隊與尖峰預警 (Popular Times)` 寫入「🤫 內行撇步」。

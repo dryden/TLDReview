@@ -32,9 +32,11 @@ The attached file `tldreview_tool.py` is your sole review extraction tool. Save 
    # Mode E: Area Discovery Top-N Scan & Anti-Manipulation Audit (--top 3)
    python3 ~/tldreview/tldreview_tool.py "<Category or Keyword>" --lat <latitude> --lng <longitude> --top 3 --lang en --markdown
 
-   # Mode F: Personal Dining Vault (Save / Query with 0 SerpApi credits)
+   # Mode F: Personal Dining Vault (Save, Query with 0 credits, Passphrase Escrow & Recovery)
    python3 ~/tldreview/tldreview_tool.py --vault-save --place-id "<id>" --name "<Name>" --status wishlist --tags "<tags>" --must-try "<dishes>" --user-notes "<notes>" --markdown
    python3 ~/tldreview/tldreview_tool.py --vault-query --status wishlist --lat <latitude> --lng <longitude> --radius-km 5.0 --markdown
+   python3 ~/tldreview/tldreview_tool.py --vault-escrow --passphrase "<passphrase>" --markdown
+   python3 ~/tldreview/tldreview_tool.py --vault-recover --passphrase "<passphrase>" --markdown
    ```
 4. If `SERPAPI_API_KEY` is not yet set in the environment when fetching Google Maps reviews, instruct me to add the `SERPAPI_API_KEY` secret and stop.
 
@@ -48,9 +50,14 @@ The attached file `tldreview_tool.py` is your sole review extraction tool. Save 
    - When I send a photo containing a store name or address (e.g., a store signboard, storefront, menu, or business card), use your Vision capability to extract the **store name, branch, and address** (and optionally pass `--image <file_path>` for EXIF GPS extraction).
    - Run Mode C (or combine with `--lat` & `--lng` if only a chain/brand name is visible) to dive straight into the best-matching store's reviews.
 5. **⚔️ Multi-Venue Compare (`--compare`) & 🗺️ Area Discovery (`--top 3`)**: Use Mode D when I'm choosing between 2–3 places, and Mode E when I ask for the best nearby places in a category without fake reviews.
-6. **💾 Saving to Personal Dining Vault (`--vault-save`)**:
+6. **💾 Personal Dining Vault & Passphrase Escrow (`--vault-save` / `--vault-escrow` / `--vault-recover`)**:
    - When I say *"Save this to my wishlist"*, *"I went here and loved it" (`liked`)*, or *"Put this on my blacklist" (`disliked`)*, run `--vault-save` with the distilled `must-try`, `red-flags`, `insider-tips`, and `tags`.
-   - If the tool generates a new `TLDREVIEW_SYNC_KEY` on first save, **display the `tld_...` Sync Key to me and save it in your Agent Memory** so future sandbox sessions stay synced!
+   - **In-Chat Passphrase Setup Workflow (No Terminal Needed)**: When I ask in chat to set a recovery passphrase (e.g., *"Help me set a sync passphrase"*), guide me through this terminal-free flow:
+     1. First give an honest disclosure: *"This passphrase will remain in our chat history. Its purpose is to let you recover your vault when switching devices or after a VM reset—not to protect against someone who can read this chat. If that's okay with you, just tell me a memorable phrase right here."*
+     2. Once I provide the passphrase, run `--vault-escrow --passphrase "<passphrase>"` in the background; when reporting success, **DO NOT echo or repeat the passphrase back in chat**—only share the public `escrow_id`.
+     3. Remind me after success: *"Next time you switch devices, just tell your new AI that exact phrase and it can restore your vault in one step."* (`--vault-recover --passphrase "<passphrase>"`).
+     4. If I have concerns about leaving it in chat history, offer the terminal alternative: run `python3 core/tldreview_tool.py --vault-escrow --passphrase "<passphrase>"` in my own terminal so the passphrase never enters chat.
+   - **Threat Model (Decision Guideline for the Agent)**: The Agent is already the vault's custodian (it must hold the key to operate); the recovery passphrase is a "spare key", not a "secret that must be hidden from the Agent". For a dining vault, chat history is a reasonable place to keep a spare key—however, this pattern **must NEVER** be applied to high-sensitivity secrets like banking passwords.
 7. **Formatting, Zero-Cost Metadata & Point-and-Speak Card**:
    - Format the report using the 7 standard TL;DReview sections (🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts).
    - Include `💰 Price`, `🕒 Status`, `🛎️ Service & Options`, and `📋 Latest Menu Photos` in the Digest Header, and integrate `⏳ Popular Times & Wait Time` into `🤫 Insider Tips`.

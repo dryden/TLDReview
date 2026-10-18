@@ -43,7 +43,12 @@
 6. **🔒 模式六：零知識端到端加密（E2EE）個人美食金庫（`--vault-save` ／ `--vault-query` ／ `--vault-escrow` ／ `--vault-recover`）**
    - **記憶優先檢索（Memory-First Lookup）**：當使用者詢問某區域推薦、或問「我的口袋名單有什麼？」、「附近有沒有我之前存過想去的店？」時，**優先執行 `--vault-query`（或 MCP/LangChain 的 `tldreview_vault_query`）**，例如：`python3 core/tldreview_tool.py --vault-query --status wishlist --lat <緯度> --lng <經度> --radius-km 5.0 --markdown`。此操作完全在本地解密並計算 Haversine 距離，**消耗 0 點 SerpApi 額度**！
    - **儲存與狀態更新（Upsert & Status Transition）**：當使用者表示「把這家存進想去清單 (`wishlist`)」、「這家吃過很推 (`liked`)」或「加入黑名單 (`disliked`)」時，執行 `--vault-save`（或 `tldreview_vault_save`），並將報告提煉出的 `--must-try`、`--red-flags`、`--insider-tips` 與 `--tags` 一併存入。
-   - **一句話密語託管與跨裝置復原（Passphrase Escrow）**：首次存店時，請主動建議使用者設定一句好記的「復原密語」（執行 `--vault-escrow --passphrase "<使用者設定的句子>"`），並將金鑰路徑（`~/.tldreview/sync.key`）或環境變數 `TLDREVIEW_SYNC_KEY` 存入 Agent 長期記憶。未來若沙盒重置或換裝置，只要執行 `--vault-recover --passphrase "<復原密語>"` 即可一鍵找回金鑰與所有餐廳清單；也可使用 `--vault-status` 診斷連線狀態，或用 `--vault-export` / `--vault-import` 匯出匯入 JSON 備份。
+   - **對話內密語設定流程（不使用終端機）**：當使用者在對話中表示要設定復原密語（例如「幫我設定同步密碼」），請依以下流程引導，全程不需要終端機：
+     1. 先說一句誠實的告知（可直接用原話）：「這句密語會留在我們的對話記錄中。它的作用是讓你換裝置或 VM 重建時能找回金庫，不是防範能看到對話的人。如果你可以接受，請直接在這裡告訴我一句好記的話。」
+     2. 使用者提供密語後，在背後執行 `--vault-escrow --passphrase "<密語>"`；回報成功時**不要**把密語重複貼回對話中，只需給 `escrow_id`（可公開的查詢 ID）。
+     3. 成功後提醒：「之後換裝置時，只要把當初這句話再告訴新的 AI，就能一鍵復原。」（換裝置或 VM 重建時執行 `--vault-recover --passphrase "<密語>"`；亦可用 `--vault-status` 診斷連線狀態）。
+     4. 若使用者對「留在對話記錄」有疑慮，提供替代方案：在自己的終端機執行 `python3 core/tldreview_tool.py --vault-escrow --passphrase "<密語>"`，密語不經過任何對話。
+   - **威脅模型（給 agent 的判斷準則）**：Agent 本來就是金庫的 custodian（必須持有 key 才能運作），復原密語是「備用鑰匙」而非「不能讓 agent 知道的秘密」。對美食 vault 而言，對話記錄是合理的備用鑰匙存放處；但此模式**不可**套用於銀行密碼等高敏感場景。
    - **結尾溫馨提示（Post-Digest Nudge）**：每次完成單一店家的深度探店報告後，於結尾加上一行簡短提示，詢問使用者是否要將該店加入「📌 想去清單 (`wishlist`)」或標記為「❤️ 喜歡 (`liked`) ／ 💣 避雷 (`disliked`)」。
 
 ---

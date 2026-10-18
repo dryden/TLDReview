@@ -2962,8 +2962,11 @@ def format_key_handover_notice(
         summary_msg = (
             f"🔑 同步金鑰已自動產生並存於 `{abs_key_path}`（權限 0600，Vault ID: `{vault_id}`）。\n"
             "⚠️ 因目前非互動式終端機（Agent/Pipe 模式），為安全起見不直接於日誌裸露金鑰本體。\n"
-            "💡 強烈建議立即執行 `--vault-escrow --passphrase \"<設定一句好記的復原密語>\"` 啟用一句話雲端託管，"
-            "或將環境變數 `TLDREVIEW_SYNC_KEY` / `~/.tldreview/` 目錄持久化；若金鑰遺失且未設密語，雲端加密資料將永久無法解密！"
+            "💡 【對話內密語設定引導】若使用者想設定復原密語，請依下列流程引導（全程不需終端機）：\n"
+            "   1. 先誠實告知：「這句密語會留在我們的對話記錄中。它的作用是讓你換裝置或 VM 重建時能找回金庫，不是防範能看到對話的人。如果你可以接受，請直接在這裡告訴我一句好記的話。」\n"
+            "   2. 使用者提供後在背後執行 `--vault-escrow --passphrase \"<密語>\"`，回報成功時【絕不】重複貼回密語，只需給 escrow_id。\n"
+            "   3. 成功後提醒：「之後換裝置時，只要把當初這句話再告訴新的 AI，就能一鍵復原。」\n"
+            "   4. 若使用者有疑慮，提供終端機替代方案：在自己的終端機執行 `python3 core/tldreview_tool.py --vault-escrow --passphrase \"<密語>\"`。"
         )
     return {
         "key_generated": True,
@@ -4291,8 +4294,8 @@ def format_vault_markdown_output(result: dict) -> str:
                 f"# 🛡️ TL;DReview 復原密語託管成功 (Passphrase Escrow)",
                 f"- **保護對象 Vault ID**: `{result.get('vault_id')}`",
                 f"- **雲端託管識別碼 (`escrow_id`)**: `{result.get('escrow_id')}` (KDF: `{result.get('kdf')}`)",
-                "- **使用方式**: 未來若更換電腦或 AI 沙盒被重置，不需尋找金鑰檔案，只要執行：",
-                "  `python3 core/tldreview_tool.py --vault-recover --passphrase \"<你設定的復原密語>\"` 即可一鍵找回所有清單！",
+                "- **給 Agent 的回覆規範**: 回報成功時**不要**把密語重複貼回對話中，只需給上方的 `escrow_id`（可公開的查詢 ID）。",
+                "- **復原提醒**: 換裝置或 VM 重建時，使用者只要把當初這句話再告訴新的 AI，執行 `--vault-recover --passphrase \"<密語>\"` 即可一鍵復原。",
                 "- ⚠️ **重要提醒**: 雲端伺服器沒有你的密語，若忘記此密語且無本地金鑰備份，將沒有任何客服能為你重設。",
             ])
         else:

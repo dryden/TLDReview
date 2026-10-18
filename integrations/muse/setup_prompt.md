@@ -40,10 +40,15 @@ If Sentinel prompts for network access, request my approval for the domains abov
 5. **⚔️ Multi-Venue Compare (`--compare`) & 🗺️ Area Discovery (`--top 3`)**:
    - Compare 2+ stores side-by-side: `python3 ~/tldreview_tool.py "<Store A>" "<Store B>" --compare --lang en --markdown`
    - Area Discovery + Anti-Manipulation Audit: `python3 ~/tldreview_tool.py "<Category>" --lat <lat> --lng <lng> --top 3 --lang en --markdown`
-6. **💾 Save to Personal Dining Vault (`--vault-save`)**:
+6. **💾 Personal Dining Vault & Passphrase Escrow (`--vault-save` / `--vault-escrow` / `--vault-recover`)**:
    - Save or update a place (`wishlist`, `liked`, `disliked`):
      `python3 ~/tldreview_tool.py --vault-save --place-id "<id>" --name "<Name>" --status wishlist --tags "<tags>" --must-try "<dishes>" --user-notes "<notes>" --markdown`
-   - If a new `TLDREVIEW_SYNC_KEY` is generated on first save, **display the `tld_...` key to me and store it in your Agent Memory**!
+   - **In-Chat Passphrase Setup Workflow (No Terminal Needed)**: When I ask in chat to set a recovery passphrase (e.g., *"Help me set a sync passphrase"*), guide me through this terminal-free flow:
+     1. First give an honest disclosure: *"This passphrase will remain in our chat history. Its purpose is to let you recover your vault when switching devices or after a VM reset—not to protect against someone who can read this chat. If that's okay with you, just tell me a memorable phrase right here."*
+     2. Once I provide the passphrase, run `python3 ~/tldreview_tool.py --vault-escrow --passphrase "<passphrase>" --markdown` in the background; when reporting success, **DO NOT echo or repeat the passphrase back in chat**—only share the public `escrow_id`.
+     3. Remind me after success: *"Next time you switch devices, just tell your new AI that exact phrase and it can restore your vault in one step."* (`python3 ~/tldreview_tool.py --vault-recover --passphrase "<passphrase>" --markdown`).
+     4. If I have concerns about leaving it in chat history, offer the terminal alternative: run `python3 core/tldreview_tool.py --vault-escrow --passphrase "<passphrase>"` in my own terminal so the passphrase never enters chat.
+   - **Threat Model (Decision Guideline for the Agent)**: The Agent is already the vault's custodian (it must hold the key to operate); the recovery passphrase is a "spare key", not a "secret that must be hidden from the Agent". For a dining vault, chat history is a reasonable place to keep a spare key—however, this pattern **must NEVER** be applied to high-sensitivity secrets like banking passwords.
 7. **Report Rules & Traveler's Point-and-Speak Card**:
    - Base your report 100% on the returned review evidence and metadata—strictly no hallucination.
    - Surface `💰 Price`, `🕒 Status`, `🛎️ Service & Options`, and `📋 Latest Menu Photos` in the Digest Header, and integrate `⏳ Popular Times & Wait Time` into `🤫 Insider Tips`.
