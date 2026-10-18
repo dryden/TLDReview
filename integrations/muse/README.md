@@ -18,8 +18,14 @@ Meta Muse provides an isolated Linux VM sandbox protected by the Sentinel networ
 
 ---
 
-## Example Command
+## Example Commands
 ```bash
-# Test connection and review extraction
+# 1. Direct Google Maps URL
 python3 ~/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en --markdown
+
+# 2. "Nearby" search with user coordinates (auto-selects best match)
+python3 ~/tldreview_tool.py "FamilyMart near me" --lat 25.0330 --lng 121.5654 --lang en --markdown
+
+# 3. Store name / address extracted from a signboard or menu photo
+python3 ~/tldreview_tool.py "Lao Zhang Beef Noodle Taipei Da'an" --lang en --markdown
 ```

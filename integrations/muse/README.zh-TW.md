@@ -20,6 +20,12 @@ Meta Muse 具備獨立的 Linux VM 沙盒環境與 Sentinel 網路防護機制�
 
 ## 常用指令範例
 ```bash
-# 測試連線與抓取
+# 1. Google Maps 網址查詢
 python3 ~/tldreview_tool.py "https://maps.app.goo.gl/sample" --markdown
+
+# 2. 「附近店家」座標搜尋（自動進入最符合店家評論）
+python3 ~/tldreview_tool.py "附近的全家便利商店" --lat 25.0330 --lng 121.5654 --markdown
+
+# 3. 招牌／菜單照片辨識後以店名或地址搜尋
+python3 ~/tldreview_tool.py "老張牛肉麵 台北市大安區" --markdown
 ```

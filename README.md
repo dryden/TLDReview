@@ -9,18 +9,34 @@
 🌐 **[Official Website (tldreview.app)](https://tldreview.app/)**
 
 [![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
+[![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)](#-whats-new-changelog)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-tldreview-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/tldreview)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
 
 ---
 
+## 🆕 What's New (Changelog)
+
+### 🎉 v1.1.0
+- 📍 **"Nearby" & Natural-Language Store Search**: In addition to Google Maps URLs, you can now ask directly for nearby stores (e.g., *"FamilyMart near me"* / *"附近的全家便利商店"*). Your AI Agent acquires your current coordinates (`--lat`, `--lng`), filters out sponsored ads, calculates Haversine distances, and jumps straight into the best-matching branch's reviews.
+- 📸 **Store Signboard & Menu Photo Lookup**: Snap and send a photo of a store's signboard, menu, business card, or address plate. Combines AI Vision recognition with built-in zero-dependency EXIF GPS extraction (`--image`) to resolve the store and analyze its reviews.
+- 🧩 **Unified Agent & Tooling Upgrade**: Updated Core CLI, MCP Server, LangChain `@tool`, xAI Grok Bot, Meta Muse, and Master System Prompts to seamlessly support all three query modes.
+
+---
+
 ## 🦊 What is TL;DReview?
 
-**TL;DReview** ([https://tldreview.app/](https://tldreview.app/)) is a Google Maps review extraction and intelligence engine built for AI Agents and personal assistants. Paste any Google Maps link, and it distills hundreds of noisy, lengthy reviews into a structured, evidence-backed briefing: **Must-Try Highlights, Strengths, Weaknesses & Red Flags, Insider Tips, Operational Rules, and Transit & Parking**—so you know everything that matters before you go.
+**TL;DReview** ([https://tldreview.app/](https://tldreview.app/)) is a Google Maps review extraction and intelligence engine built for AI Agents and personal assistants. It supports **three intuitive input modes**:
+1. 🔗 **Paste any Google Maps URL** (including short links & social redirect wrappers)
+2. 📍 **Ask for a "Nearby" Place** (e.g., *"FamilyMart near me"* / *"附近的全家便利商店"*—your AI Agent acquires your current coordinates, searches Google Maps, and jumps straight into the best-matching store's reviews)
+3. 📸 **Send a Photo of a Store Signboard or Menu** (snap a storefront sign, menu, business card, or address plate—the AI extracts the store name/address and analyzes its reviews)
+
+No matter how you search, TL;DReview distills hundreds of noisy, lengthy reviews into a structured, evidence-backed briefing: **Must-Try Highlights, Strengths, Weaknesses & Red Flags, Insider Tips, Operational Rules, and Transit & Parking**—so you know everything that matters before you go.
 
 ---
 
@@ -43,7 +59,7 @@ In practice, pasting a raw Google Maps URL into a general-purpose AI fails or pr
 
 | Stage | Pasting a Raw URL into a General AI | Using the 🦊 TL;DReview Skill |
 | :--- | :--- | :--- |
-| **1. URL Resolution** | Short links (`maps.app.goo.gl`) and redirect chains often fail, or the AI grabs the wrong hex ID from nearby landmarks in the URL. | Automatically unwraps short links, Instagram wrappers, and EU consent walls, then isolates the exact target `CID / Place ID`. |
+| **1. URL & Place Resolution** | Short links (`maps.app.goo.gl`) often fail, and general AIs can't resolve "nearby" coordinates to the exact closest branch ID. | Unwraps short links & consent walls, and supports **coordinate-based "nearby" search** plus **signboard/menu photo lookup** into the exact best-matching `CID / Place ID`. |
 | **2. Reading Reviews** | Google Maps reviews are dynamically rendered via complex JS with strict anti-bot blocks. Built-in AI web fetchers only see an empty HTML shell and **cannot read a single review**. | Connects via structured API to reliably extract full review text, timestamps, helpful vote counts, and 1★–5★ rating distributions. |
 | **3. Hallucination Risk** | When the AI can't read the reviews, it quietly falls back to searching outdated food blogs—or **hallucinates dishes and flavors out of thin air** based on the place's name. | **100% Evidence-Bound**: Every claim must come from fetched customer reviews. Sections without direct evidence are omitted entirely. |
 | **4. Signal-to-Noise** | Even if you manually copy-paste reviews, the top results are often flooded with one-word spam or outdated 5-year-old comments. | Filters out reviews older than 2 years, prioritizes **Local Guides**, and **forcibly preserves ★1–★3 critical reviews** so red flags aren't buried. |
@@ -52,9 +68,10 @@ In practice, pasting a raw Google Maps URL into a general-purpose AI fails or pr
 
 ### 🔧 What Technical Details Does TL;DReview Handle Under the Hood?
 
-1. **🔗 Short URL Unwrapping & Precision ID Disambiguation**
-   - Links shared from the Google Maps mobile app are usually short URLs (`maps.app.goo.gl/...`, `share.google/...`), social media redirect wrappers (`l.instagram.com/?u=...`), or regional cookie walls (`consent.google.com`).
-   - Even after expanding to a full URL, Google Maps `data=!4m6!3m5...` parameters frequently contain multiple hex identifiers—such as referring landmarks (`!5s0x...`) alongside the actual destination (`!1s0x...`). TL;DReview's parser specifically targets `!1s` CIDs, converts decimal `data_cid` values, and extracts `ChI...` Place IDs or `/g/...` Knowledge Graph IDs so the wrong place is never queried.
+1. **🔗 Multi-Modal Entry: Short URL Unwrapping + Coordinate "Nearby" Search + Signboard/Menu Photo Lookup**
+   - **Short URL & ID Disambiguation**: Automatically unwraps `maps.app.goo.gl/...`, `share.google/...`, `l.instagram.com/?u=...`, and `consent.google.com`, specifically targeting `!1s` destination CIDs while ignoring `!5s` referring landmarks.
+   - **Coordinate-Based "Nearby" Search**: When you say *"FamilyMart near me"* (`附近的全家便利商店`), your AI Agent passes your current `(lat, lng)` coordinates to TL;DReview, which queries Google Maps, computes Haversine distances across branches, locks onto the best-matching nearby store, and immediately fetches its reviews.
+   - **Signboard & Menu Photo Recognition**: When you send a photo of a store's **signboard (招牌), menu (菜單), or business card**, your AI Agent extracts the store name/address via Vision (coupled with built-in zero-dependency EXIF GPS extraction via `--image`) and jumps straight into the matched store's review digest.
 
 2. **🧹 Multi-Stage Review Curation for True Representativeness**
    - Raw Google Maps reviews are noisy—filled with outdated feedback from years ago (often under previous management) and low-effort one-liners.
@@ -93,11 +110,13 @@ In practice, pasting a raw Google Maps URL into a general-purpose AI fails or pr
 
 ```mermaid
 graph TD
-    User([User sends Google Maps URL]) --> Agent[AI Agent / Grok / Muse / Claude]
+    U1([🔗 Google Maps URL]) --> Agent[AI Agent / Grok / Muse / Claude]
+    U2([📍 'Nearby' Query + User Coordinates]) --> Agent
+    U3([📸 Store Signboard / Menu Photo]) --> Agent
     Agent --> Core[core/tldreview_tool.py]
-    Core --> ShortURL[Unwrap Short URL & Extract CID]
-    Core --> SerpApi[Fetch Local + English Reviews via SerpApi]
-    Core --> Filter[Curate Reviews & Compress Token Density]
+    Core --> Resolve[Unwrap URL or Search Best-Matching Place]
+    Resolve --> SerpApi[Fetch Local + English Reviews via SerpApi]
+    SerpApi --> Filter[Curate Reviews & Compress Token Density]
     Filter --> Prompt[prompts/SYSTEM_PROMPT_EN.md]
     Prompt --> Output[🦊 Actionable Intelligence Report]
 ```
@@ -175,10 +194,19 @@ TL;DReview fetches structured Google Maps reviews via [SerpApi](https://serpapi.
 # 1. Set your SerpApi API Key (via export, or copy .env.example to .env)
 export SERPAPI_API_KEY="your_api_key_here"
 
-# 2. Run the zero-dependency script directly and output Markdown
+# 2A. Direct Google Maps URL (zero third-party dependencies)
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en --markdown
 
-# Advanced options: sort order (newest / lowest / highest) or 1-credit quota-saving mode (--save-quota)
+# 2B. "Nearby" search with user coordinates (locks onto the closest best-matching store)
+python3 core/tldreview_tool.py "FamilyMart near me" --lat 25.0330 --lng 121.5654 --lang en --markdown
+
+# 2C. Store name / address search (or recognized by your AI Agent from a signboard/menu photo)
+python3 core/tldreview_tool.py "Lao Zhang Beef Noodle Taipei Da'an" --lang en --markdown
+
+# 2D. Direct signboard/menu photo input (extracts EXIF GPS automatically; uses GEMINI_API_KEY for CLI OCR)
+python3 core/tldreview_tool.py --image ./signboard.jpg --lang en --markdown
+
+# Advanced options: sort order (newest / lowest / highest) or quota-saving mode (--save-quota)
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en --sort-by newest --save-quota --markdown
 
 # Output structured JSON for downstream pipelines
@@ -186,7 +214,7 @@ python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en
 
 # (Optional) Install globally as the `tldreview` CLI command
 pip install -e .
-tldreview "https://maps.app.goo.gl/sample" --lang en --markdown
+tldreview "FamilyMart near me" --lat 25.0330 --lng 121.5654 --lang en --markdown
 ```
 
 ---
@@ -195,6 +223,15 @@ tldreview "https://maps.app.goo.gl/sample" --lang en --markdown
 
 Want to build an adapter for another platform (OpenAI Custom GPTs, Discord, Telegram, Dify, Coze, etc.)?  
 Check out [CONTRIBUTING.md](CONTRIBUTING.md) and open a Pull Request!
+
+---
+
+## ☕ Support & Sponsor
+
+If **TL;DReview** saves you time and helps you dodge tourist traps, consider buying us a coffee to support ongoing development:  
+👉 **[Buy Me a Coffee (https://buymeacoffee.com/tldreview)](https://buymeacoffee.com/tldreview)**
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support%20TL%3BDReview-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/tldreview)
 
 ---
 

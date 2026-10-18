@@ -285,6 +285,174 @@ class TestTLDReviewCore(unittest.TestCase):
             self.assertEqual(res["place"]["name"], "測試餐廳")
             self.assertEqual(res["place"]["type"], "餐廳")
 
+    def test_clean_search_query_and_coordinate_parsing(self) -> None:
+        from core.tldreview_tool import (
+            clean_search_query,
+            extract_inline_coordinates,
+            format_serpapi_ll,
+            parse_ll_string,
+        )
+
+        self.assertEqual(clean_search_query("附近的全家便利商店", has_coords=True), "全家便利商店")
+        self.assertEqual(clean_search_query("幫我查一下這附近的牛肉麵評價", has_coords=True), "牛肉麵")
+        self.assertEqual(clean_search_query("FamilyMart near me", has_coords=True), "FamilyMart")
+        self.assertEqual(clean_search_query("台北大安區老張牛肉麵"), "台北大安區老張牛肉麵")
+
+        self.assertEqual(parse_ll_string("@25.0330,121.5654,15z"), (25.033, 121.5654, 15))
+        self.assertEqual(parse_ll_string("25.0330, 121.5654"), (25.033, 121.5654, None))
+        self.assertEqual(format_serpapi_ll(25.033, 121.5654, 15), "@25.033000,121.565400,15z")
+
+        q_text, coords = extract_inline_coordinates("附近的全家便利商店 25.0330, 121.5654")
+        self.assertEqual(q_text, "附近的全家便利商店")
+        self.assertEqual(coords, (25.033, 121.5654))
+
+    def test_nearby_search_picks_closest_matching_branch_and_fetches_reviews(self) -> None:
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        sample_reviews = [
+            Review(
+                author="LocalUser",
+                text="這間全家店員親切，咖啡機跟夯番薯都有，座位區乾淨。",
+                rating=5.0,
+                published_at=recent_iso,
+                is_local_guide=True,
+                review_id="fm_1",
+            )
+        ]
+
+        # Simulate SerpApi google_maps search returning:
+        # 0: Sponsored unrelated ad
+        # 1: Farther FamilyMart (450m away)
+        # 2: Closest FamilyMart (60m away) -> should be selected!
+        search_payload = {
+            "local_results": [
+                {
+                    "title": "贊助商廣告店家",
+                    "data_id": "0x111:0xaaa",
+                    "sponsored": True,
+                    "gps_coordinates": {"latitude": 25.0330, "longitude": 121.5654},
+                },
+                {
+                    "title": "全家便利商店 台北遠距店",
+                    "address": "台北市信義區松仁路100號, 台灣",
+                    "data_id": "0x3442abb6da9c9e1f:0xbbbbbbbbbbbbbbbb",
+                    "rating": 4.1,
+                    "reviews": 210,
+                    "type": "便利商店",
+                    "gps_coordinates": {"latitude": 25.0370, "longitude": 121.5654},
+                },
+                {
+                    "title": "全家便利商店 台北信義店",
+                    "address": "台北市信義區信義路五段7號, 台灣",
+                    "data_id": "0x3442abb6da9c9e1f:0xcccccccccccccccc",
+                    "rating": 4.4,
+                    "reviews": 85,
+                    "type": "便利商店",
+                    "gps_coordinates": {"latitude": 25.0334, "longitude": 121.5654},
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"TLDREVIEW_CACHE_DIR": tmpdir}
+        ), patch(
+            "core.tldreview_tool.http_get_json",
+            return_value=search_payload,
+        ), patch(
+            "core.tldreview_tool.fetch_serpapi_reviews",
+            return_value=(sample_reviews, 85, None, {}),
+        ) as mock_reviews:
+            res = run_pipeline(
+                "附近的全家便利商店",
+                api_key="dummy_key",
+                preferred_lang="zh-TW",
+                use_cache=False,
+                save_quota=True,
+                lat=25.0330,
+                lng=121.5654,
+            )
+            self.assertEqual(res["status"], "success")
+            self.assertEqual(res["data_id"], "0x3442abb6da9c9e1f:0xcccccccccccccccc")
+            self.assertEqual(res["place"]["name"], "全家便利商店 台北信義店")
+            self.assertIn("search", res)
+            self.assertEqual(res["search"]["cleaned_query"], "全家便利商店")
+            self.assertLess(res["search"]["matched_distance_m"], 100)
+            self.assertEqual(mock_reviews.call_count, 1)
+
+            md = format_markdown_output(res, include_agent_instructions=True)
+            self.assertIn("🔍 搜尋匹配: 「全家便利商店」最佳符合店家", md)
+            self.assertIn("📌 其他相近候選: 2. 全家便利商店 台北遠距店", md)
+
+    def test_exif_gps_extraction_and_signboard_image_pipeline(self) -> None:
+        import struct
+        from core.tldreview_tool import extract_exif_gps
+
+        # Build a minimal valid JPEG with EXIF APP1 containing GPS (25.0330 N, 121.5654 E)
+        # TIFF little-endian ('II*\x00'), IFD0 at offset 8 with 1 entry (0x8825 -> offset 26)
+        ifd0 = struct.pack("<H", 1) + struct.pack("<HHI4s", 0x8825, 4, 1, struct.pack("<I", 26)) + struct.pack("<I", 0)
+        # GPS IFD at offset 26 with 4 entries (tags 1, 2, 3, 4) -> 2 + 4*12 + 4 = 54 bytes (ends at offset 80)
+        lat_dms = struct.pack("<6I", 25, 1, 1, 1, 5880, 100)   # 25 deg, 1 min, 58.80 sec = 25.0330
+        lng_dms = struct.pack("<6I", 121, 1, 33, 1, 5544, 100)  # 121 deg, 33 min, 55.44 sec = 121.5654
+        gps_entries = (
+            struct.pack("<H", 4)
+            + struct.pack("<HHI4s", 1, 2, 2, b"N\x00\x00\x00")
+            + struct.pack("<HHI", 2, 5, 3) + struct.pack("<I", 80)
+            + struct.pack("<HHI4s", 3, 2, 2, b"E\x00\x00\x00")
+            + struct.pack("<HHI", 4, 5, 3) + struct.pack("<I", 104)
+            + struct.pack("<I", 0)
+        )
+        tiff = b"II" + struct.pack("<HI", 42, 8) + ifd0 + gps_entries + lat_dms + lng_dms
+        app1_payload = b"Exif\x00\x00" + tiff
+        jpeg_bytes = b"\xff\xd8\xff\xe1" + struct.pack(">H", len(app1_payload) + 2) + app1_payload + b"\xff\xd9"
+
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        sample_reviews = [
+            Review(author="Foodie", text="招牌紅燒半筋半肉麵必點！", rating=5.0, published_at=recent_iso, review_id="lz_1")
+        ]
+        place_search_payload = {
+            "place_results": {
+                "title": "老張牛肉麵",
+                "address": "台北市大安區愛國東路105號, 台灣",
+                "data_id": "0x3442abb6da9c9e1f:0xdddddddddddddddd",
+                "rating": 4.3,
+                "reviews": 1820,
+                "type": "麵食餐廳",
+                "gps_coordinates": {"latitude": 25.0331, "longitude": 121.5655},
+                "rating_summary": {"5": 1000, "4": 500, "1": 50},
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = os.path.join(tmpdir, "signboard.jpg")
+            with open(img_path, "wb") as f:
+                f.write(jpeg_bytes)
+
+            coords = extract_exif_gps(img_path)
+            self.assertIsNotNone(coords)
+            self.assertAlmostEqual(coords[0], 25.0330, places=4)  # type: ignore[index]
+            self.assertAlmostEqual(coords[1], 121.5654, places=4)  # type: ignore[index]
+
+            with patch.dict(os.environ, {"TLDREVIEW_CACHE_DIR": tmpdir}), patch(
+                "core.tldreview_tool.extract_query_from_image",
+                return_value={"store_name": "老張牛肉麵", "address": "愛國東路105號", "search_query": "老張牛肉麵 愛國東路105號"},
+            ) as mock_ocr, patch(
+                "core.tldreview_tool.http_get_json",
+                return_value=place_search_payload,
+            ), patch(
+                "core.tldreview_tool.fetch_serpapi_reviews",
+                return_value=(sample_reviews, 1820, None, {}),
+            ):
+                res = run_pipeline(
+                    "",
+                    api_key="dummy_key",
+                    preferred_lang="zh-TW",
+                    use_cache=False,
+                    image_path=img_path,
+                )
+                self.assertEqual(mock_ocr.call_count, 1)
+                self.assertEqual(res["place"]["name"], "老張牛肉麵")
+                self.assertEqual(res["search"]["cleaned_query"], "老張牛肉麵 愛國東路105號")
+                self.assertAlmostEqual(res["search"]["latitude"], 25.0330, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

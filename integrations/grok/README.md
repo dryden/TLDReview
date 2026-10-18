@@ -24,9 +24,15 @@ Open [`setup_prompt.md`](./setup_prompt.md), copy the prompt block, and send it 
 
 ---
 
-## Daily Usage
-Simply paste any Google Maps link into your Grok chat:
-```text
-Is this place worth visiting? https://maps.app.goo.gl/xxxxxx
-```
-Grok will automatically run the tool, fetch real customer reviews, and generate a high-density intelligence report!
+## Daily Usage (3 Input Modes)
+1. **🔗 Paste a Google Maps Link**:
+   ```text
+   Is this place worth visiting? https://maps.app.goo.gl/xxxxxx
+   ```
+2. **📍 Ask for a "Nearby" Store**:
+   ```text
+   Check the reviews for FamilyMart near me
+   ```
+   *(Grok acquires your current coordinates, searches Google Maps, and jumps straight into the best-matching store's reviews)*
+3. **📸 Send a Photo of a Signboard or Menu**:
+   Snap a photo of a store's **signboard (招牌), menu (菜單), or business card** and send it to Grok—it will recognize the store name/address, lock onto the best match, and generate a high-density intelligence report!

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tldreview"
-version = "0.2.0"
+version = "1.1.0"
 description = "Turn messy Google Maps reviews into actionable, anti-hallucination intelligence for any AI Agent."
 readme = "README.md"
 license = { file = "LICENSE" }

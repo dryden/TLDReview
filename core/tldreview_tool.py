@@ -5,7 +5,12 @@ Official Website: https://tldreview.app/
 
 A zero-dependency standalone tool designed for agent sandboxes, including
 Meta Muse and Grok Bot cloud computers.
-Extracts Google Maps URLs, resolves redirects, grabs reviews via SerpApi,
+Supports:
+1. Direct Google Maps URLs (including short links & redirect wrappers)
+2. Natural-language / nearby search queries with optional user coordinates (e.g., "附近的全家便利商店")
+3. Store signboard / menu photo inputs (via Agent Vision or built-in EXIF GPS + Vision OCR)
+
+Extracts or searches the best-matching Google Maps place, grabs reviews via SerpApi,
 filters and trims reviews for maximum density, and outputs structured data
 for an LLM to analyze.
 
@@ -14,11 +19,15 @@ Zero third-party dependencies: uses only Python 3 standard library.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
+import math
+import mimetypes
 import os
 import re
+import struct
 import sys
 import time
 from typing import Any, Iterable, List, Optional, Tuple
@@ -30,6 +39,9 @@ import urllib.request
 # Constants & Tunables (Aligned with production tldreview engine)
 # ---------------------------------------------------------------------------
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+GEMINI_VISION_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+)
 HTTP_TIMEOUT = 30.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,13 +59,20 @@ MAX_SINGLE_REVIEW_CHARS = 1200
 NEXT_PAGE_THRESHOLD = 500
 ELLIPSIS = "…"
 
-# Regular Expressions for URL & ID Extraction
+# Regular Expressions for URL, Coordinate & ID Extraction
 _URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _CID_RE = re.compile(r"0x[0-9a-f]+:0x[0-9a-f]+", re.IGNORECASE)
 _PLACE_ID_RE = re.compile(r"ChI[0-9A-Za-z_-]+")
 _HEX_ID_RE = re.compile(r"[0-9a-f]{16,}", re.IGNORECASE)
 _COORD_BANG_RE = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
 _COORD_AT_RE = re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)")
+_LL_STR_RE = re.compile(
+    r"^@?\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?:\s*,\s*(\d+(?:\.\d+)?)z?)?\s*$",
+    re.IGNORECASE,
+)
+_INLINE_COORD_RE = re.compile(
+    r"(?:@|(?<=\s)|^)(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})(?:,\s*\d+(?:\.\d+)?z?)?"
+)
 _PROVIDER_ID_RE = re.compile(r"/g/[0-9A-Za-z_-]+", re.IGNORECASE)
 
 # Country code to official language mapping
@@ -83,8 +102,8 @@ COUNTRY_NAMES = {
 
 
 def _redact_api_key(text: str, api_key: Optional[str] = None) -> str:
-    """Mask SerpApi keys in URLs or exception messages to prevent accidental leaks."""
-    masked = re.sub(r"(api_key=)[^&\s\"']+", r"\1***", text, flags=re.IGNORECASE)
+    """Mask API keys in URLs or exception messages to prevent accidental leaks."""
+    masked = re.sub(r"((?:api_)?key=)[^&\s\"']+", r"\1***", text, flags=re.IGNORECASE)
     if api_key and len(api_key) >= 4:
         masked = masked.replace(api_key, "***")
     return masked
@@ -346,13 +365,362 @@ def extract_maps_data_id(url: str) -> Optional[str]:
     return None
 
 
+def parse_ll_string(ll: str) -> Optional[Tuple[float, float, Optional[int]]]:
+    """Parse '@lat,lng,15z' or 'lat,lng' into (latitude, longitude, zoom)."""
+    if not ll:
+        return None
+    m = _LL_STR_RE.match(ll.strip())
+    if not m:
+        return None
+    try:
+        lat = float(m.group(1))
+        lng = float(m.group(2))
+        zoom = int(float(m.group(3))) if m.group(3) is not None else None
+    except ValueError:
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        return None
+    return lat, lng, zoom
+
+
+def format_serpapi_ll(lat: float, lng: float, zoom: int = 15) -> str:
+    """Format latitude, longitude, and zoom into SerpApi's '@lat,lng,zoomz' parameter."""
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        raise ValueError(f"Invalid coordinates: lat={lat}, lng={lng}")
+    clamped_zoom = max(3, min(21, int(zoom)))
+    return f"@{lat:.6f},{lng:.6f},{clamped_zoom}z"
+
+
+def haversine_distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> int:
+    """Calculate great-circle distance in meters between two WGS84 coordinates."""
+    r = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    return int(round(2.0 * r * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))))
+
+
 def extract_coordinates(url: str) -> Optional[Tuple[float, float]]:
-    """Extract latitude and longitude from URL pin or viewport."""
+    """Extract latitude and longitude from URL pin, viewport, or query parameter."""
+    decoded = urllib.parse.unquote(url)
     for rx in (_COORD_BANG_RE, _COORD_AT_RE):
-        m = rx.search(url)
+        m = rx.search(decoded)
         if m:
-            return float(m.group(1)), float(m.group(2))
+            lat, lng = float(m.group(1)), float(m.group(2))
+            if -90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0:
+                return lat, lng
+    try:
+        query_params = urllib.parse.parse_qs(urllib.parse.urlparse(decoded).query)
+        for key in ("q", "query", "ll", "center", "sll"):
+            for val in query_params.get(key, []):
+                parsed = parse_ll_string(val)
+                if parsed:
+                    return parsed[0], parsed[1]
+    except ValueError:
+        pass
     return None
+
+
+def extract_inline_coordinates(text: str) -> Tuple[str, Optional[Tuple[float, float]]]:
+    """Extract inline coordinates (e.g. '@25.0330,121.5654' or '25.0330, 121.5654') from free text."""
+    if not text:
+        return "", None
+    parsed_whole = parse_ll_string(text)
+    if parsed_whole:
+        return "", (parsed_whole[0], parsed_whole[1])
+
+    m = _INLINE_COORD_RE.search(text)
+    if not m:
+        return text, None
+    try:
+        lat, lng = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return text, None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        return text, None
+
+    cleaned = (text[: m.start()] + " " + text[m.end() :]).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned, (lat, lng)
+
+
+def extract_search_query_from_maps_url(url: str) -> Optional[str]:
+    """Extract a place name or search query from a Google Maps URL that lacks a direct data_id."""
+    decoded = urllib.parse.unquote(url)
+    try:
+        parsed = urllib.parse.urlparse(decoded)
+    except ValueError:
+        return None
+
+    # 1. Check /maps/search/<query> or /maps/place/<name>
+    for pattern in (r"/maps/search/([^/?#]+)", r"/maps/place/([^/?#]+)"):
+        m = re.search(pattern, parsed.path)
+        if m:
+            cand = m.group(1).replace("+", " ").strip()
+            if cand and not cand.startswith("data=") and not parse_ll_string(cand):
+                return cand
+
+    # 2. Check ?q=<query> or ?query=<query>
+    query_params = urllib.parse.parse_qs(parsed.query)
+    for key in ("q", "query"):
+        for val in query_params.get(key, []):
+            cand = val.replace("+", " ").strip()
+            if cand and not parse_ll_string(cand):
+                return cand
+    return None
+
+
+_CONV_PREFIX_RE = re.compile(
+    r"^(?:請問?|幫我|麻煩|請幫我|可以幫我)?(?:查詢|查一下|查查看|找一下|找看看|搜尋|看看|查|找)\s*",
+    re.IGNORECASE,
+)
+_CONV_SUFFIX_RE = re.compile(
+    r"\s*(?:這家店?)?(?:的?(?:Google\s*Maps?\s*)?(?:評價|評論|好不好吃?|值得去嗎|推薦嗎|避雷|報告|如何))[？?！!。.]*$",
+    re.IGNORECASE,
+)
+_NEARBY_PREFIX_RE = re.compile(
+    r"^(?:在?我?(?:目前|現在)?(?:所在)?(?:位置)?(?:這附近|我附近|附近|周邊|周遭|身邊)的?)\s*",
+    re.IGNORECASE,
+)
+_NEARBY_EN_PREFIX_RE = re.compile(r"^(?:near\s+me|nearby|closest|nearest)\s+", re.IGNORECASE)
+_NEARBY_SUFFIX_RE = re.compile(
+    r"\s*(?:near\s+me|nearby|around\s+here|around\s+me|在這?附近)$",
+    re.IGNORECASE,
+)
+
+
+def clean_search_query(raw_query: str, has_coords: bool = False) -> str:
+    """Clean conversational filler and 'nearby' prefixes from a natural-language place query."""
+    if not raw_query:
+        return ""
+    q = raw_query.strip().strip("'\"「」『』")
+    q = _CONV_PREFIX_RE.sub("", q).strip()
+    q = _CONV_SUFFIX_RE.sub("", q).strip()
+
+    # Strip '附近的' / 'nearby' prefix or suffix so Google Maps searches the store/category cleanly
+    stripped = _NEARBY_PREFIX_RE.sub("", q).strip()
+    stripped = _NEARBY_EN_PREFIX_RE.sub("", stripped).strip()
+    stripped = _NEARBY_SUFFIX_RE.sub("", stripped).strip()
+    if stripped:
+        q = stripped
+
+    return q or raw_query.strip()
+
+
+# ---------------------------------------------------------------------------
+# Step 1B: Photo / Signboard / Menu Support (Zero-dependency EXIF GPS + Vision)
+# ---------------------------------------------------------------------------
+def _parse_tiff_gps(tiff: bytes) -> Optional[Tuple[float, float]]:
+    """Extract WGS84 (lat, lng) from a raw TIFF header containing an EXIF GPSInfo IFD."""
+    if len(tiff) < 8:
+        return None
+    byte_order = tiff[:2]
+    if byte_order == b"II":
+        endian = "<"
+    elif byte_order == b"MM":
+        endian = ">"
+    else:
+        return None
+
+    magic, ifd0_offset = struct.unpack(endian + "HI", tiff[2:8])
+    if magic != 42 or ifd0_offset + 2 > len(tiff):
+        return None
+
+    type_sizes = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
+
+    def read_ifd(offset: int) -> dict[int, Tuple[int, int, bytes]]:
+        if offset + 2 > len(tiff):
+            return {}
+        count = struct.unpack(endian + "H", tiff[offset : offset + 2])[0]
+        entries: dict[int, Tuple[int, int, bytes]] = {}
+        pos = offset + 2
+        for _ in range(min(count, 256)):
+            if pos + 12 > len(tiff):
+                break
+            tag, ftype, num = struct.unpack(endian + "HHI", tiff[pos : pos + 8])
+            val_raw = tiff[pos + 8 : pos + 12]
+            pos += 12
+            tsize = type_sizes.get(ftype, 1) * num
+            if tsize <= 4:
+                data = val_raw[:tsize]
+            else:
+                data_off = struct.unpack(endian + "I", val_raw)[0]
+                if data_off + tsize > len(tiff):
+                    continue
+                data = tiff[data_off : data_off + tsize]
+            entries[tag] = (ftype, num, data)
+        return entries
+
+    ifd0 = read_ifd(ifd0_offset)
+    if 0x8825 not in ifd0:
+        return None
+    _, _, gps_ptr_bytes = ifd0[0x8825]
+    if len(gps_ptr_bytes) < 4:
+        return None
+    gps_offset = struct.unpack(endian + "I", gps_ptr_bytes[:4])[0]
+    gps_ifd = read_ifd(gps_offset)
+
+    if 2 not in gps_ifd or 4 not in gps_ifd:
+        return None
+
+    def parse_dms(data: bytes) -> Optional[float]:
+        if len(data) < 24:
+            return None
+        nums = struct.unpack(endian + "6I", data[:24])
+        if nums[1] == 0 or nums[3] == 0 or nums[5] == 0:
+            return None
+        deg = nums[0] / nums[1]
+        mins = nums[2] / nums[3]
+        secs = nums[4] / nums[5]
+        return deg + (mins / 60.0) + (secs / 3600.0)
+
+    lat = parse_dms(gps_ifd[2][2])
+    lng = parse_dms(gps_ifd[4][2])
+    if lat is None or lng is None:
+        return None
+
+    lat_ref = gps_ifd.get(1, (2, 1, b"N"))[2].decode("ascii", "ignore").strip("\x00").upper()
+    lng_ref = gps_ifd.get(3, (2, 1, b"E"))[2].decode("ascii", "ignore").strip("\x00").upper()
+    if lat_ref.startswith("S"):
+        lat = -lat
+    if lng_ref.startswith("W"):
+        lng = -lng
+
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        return None
+    return round(lat, 6), round(lng, 6)
+
+
+def extract_exif_gps(image_path: str) -> Optional[Tuple[float, float]]:
+    """Extract EXIF GPS (latitude, longitude) from a JPEG/TIFF photo using only Python stdlib."""
+    if not image_path or not os.path.isfile(image_path):
+        return None
+    try:
+        with open(image_path, "rb") as f:
+            head = f.read(262144)  # First 256 KB is sufficient for EXIF headers
+    except OSError:
+        return None
+
+    try:
+        if head.startswith((b"II*\x00", b"MM\x00*")):
+            return _parse_tiff_gps(head)
+        if not head.startswith(b"\xff\xd8"):
+            return None
+        idx = 2
+        n = len(head)
+        while idx + 4 <= n:
+            if head[idx] != 0xFF:
+                break
+            marker = head[idx + 1]
+            if marker == 0xDA or marker == 0xD9:  # SOS or EOI
+                break
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                idx += 2
+                continue
+            seg_len = struct.unpack(">H", head[idx + 2 : idx + 4])[0]
+            if seg_len < 2 or idx + 2 + seg_len > n:
+                break
+            if marker == 0xE1:  # APP1
+                payload = head[idx + 4 : idx + 2 + seg_len]
+                if payload.startswith(b"Exif\x00\x00"):
+                    coords = _parse_tiff_gps(payload[6:])
+                    if coords:
+                        return coords
+            idx += 2 + seg_len
+    except Exception:
+        return None
+    return None
+
+
+def extract_query_from_image(
+    image_path: str,
+    gemini_api_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Recognize store name, branch, and address from a signboard/menu photo via Gemini Vision API."""
+    if not image_path or not os.path.isfile(image_path):
+        raise ValueError(f"Image file not found: {image_path}")
+
+    load_dotenv_if_present()
+    key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise ValueError(
+            "To analyze an image directly via CLI (--image) without providing a store name query, "
+            "set GEMINI_API_KEY in your environment/.env, OR let your AI Agent read the store name/"
+            "address from the photo and pass it as the text query to tldreview_tool.py."
+        )
+
+    mime_type, _ = mimetypes.guess_type(image_path)
+    if not mime_type or not mime_type.startswith("image/"):
+        mime_type = "image/jpeg"
+
+    with open(image_path, "rb") as f:
+        b64_data = base64.b64encode(f.read()).decode("ascii")
+
+    prompt = (
+        "Analyze this photo (e.g. a store signboard, storefront, menu, receipt, or business card). "
+        "Extract the store name, branch name (if any), address or road/district (if any), and phone number (if any). "
+        "Return ONLY a valid JSON object with keys: "
+        '{"store_name": "...", "branch_name": "...", "address": "...", "phone": "...", "search_query": "..."} '
+        "where 'search_query' is the best concise Google Maps search query combining store_name, branch_name, and address."
+    )
+    body = json.dumps({
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64_data}},
+            ]
+        }],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{GEMINI_VISION_ENDPOINT}?key={urllib.parse.quote(key)}",
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            resp_json = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        err_body = _redact_api_key(exc.read().decode("utf-8", "replace"), key)
+        raise RuntimeError(f"Vision API HTTP {exc.code}: {err_body}") from None
+    except Exception as exc:
+        raise RuntimeError(f"Vision API request failed: {_redact_api_key(str(exc), key)}") from None
+
+    candidates = resp_json.get("candidates") or []
+    text_out = ""
+    if candidates and isinstance(candidates[0], dict):
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        if parts and isinstance(parts[0], dict):
+            text_out = str(parts[0].get("text") or "").strip()
+
+    if not text_out:
+        raise ValueError("Could not recognize store name or address from the provided image.")
+
+    # Strip markdown code fences if present
+    text_out = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out.strip(), flags=re.IGNORECASE)
+    try:
+        parsed = json.loads(text_out)
+        if not isinstance(parsed, dict):
+            parsed = {"search_query": str(parsed)}
+    except ValueError:
+        parsed = {"search_query": text_out.strip()}
+
+    if not parsed.get("search_query"):
+        parts_list = [
+            str(parsed.get(k) or "").strip()
+            for k in ("store_name", "branch_name", "address")
+            if parsed.get(k)
+        ]
+        parsed["search_query"] = " ".join(parts_list).strip()
+
+    if not parsed.get("search_query"):
+        raise ValueError("No store name or address could be identified in the image.")
+
+    return parsed
 
 
 def infer_language(address: Optional[str]) -> str:
@@ -447,27 +815,10 @@ def reviews_lookup_params(data_id: str) -> dict[str, str]:
     return {"data_id": data_id}
 
 
-def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
-    """Fetch place details (name, address, rating distribution, types) via SerpApi."""
-    lookup = place_lookup_params(data_id)
-    if not lookup:
-        log(f"Place details skipped: unsupported identifier format '{data_id}'")
-        return PlaceInfo()
-    params: dict[str, Any] = {
-        "api_key": api_key,
-        "engine": "google_maps",
-        "output": "json",
-        **lookup,
-    }
-    try:
-        payload = http_get_json(SERPAPI_ENDPOINT, params)
-    except Exception as exc:
-        log(f"Place details request warning: {exc}")
-        return PlaceInfo()
-
-    core = payload.get("place_results") if isinstance(payload.get("place_results"), dict) else payload
+def _parse_place_dict(core: dict) -> PlaceInfo:
+    """Parse a SerpApi place_results or local_results dictionary into PlaceInfo."""
     if not isinstance(core, dict):
-        core = {}
+        return PlaceInfo()
 
     name = core.get("title") or core.get("name")
     address = core.get("address") or core.get("formatted_address")
@@ -523,6 +874,154 @@ def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
         data_id=core.get("data_id"),
         place_id=core.get("place_id"),
     )
+
+
+def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
+    """Fetch place details (name, address, rating distribution, types) via SerpApi."""
+    lookup = place_lookup_params(data_id)
+    if not lookup:
+        log(f"Place details skipped: unsupported identifier format '{data_id}'")
+        return PlaceInfo()
+    params: dict[str, Any] = {
+        "api_key": api_key,
+        "engine": "google_maps",
+        "output": "json",
+        **lookup,
+    }
+    try:
+        payload = http_get_json(SERPAPI_ENDPOINT, params)
+    except Exception as exc:
+        log(f"Place details request warning: {exc}")
+        return PlaceInfo()
+
+    core = payload.get("place_results") if isinstance(payload.get("place_results"), dict) else payload
+    return _parse_place_dict(core if isinstance(core, dict) else {})
+
+
+def _query_matches_title(query: str, title: Optional[str]) -> bool:
+    """Check if the place title matches the core store name in the query."""
+    if not query or not title:
+        return False
+    q_norm = re.sub(r"[\s\-_・店分號]+", "", query.casefold())
+    t_norm = re.sub(r"[\s\-_・店分號]+", "", title.casefold())
+    if not q_norm or not t_norm:
+        return False
+    if q_norm in t_norm or t_norm in q_norm:
+        return True
+    # Also check first token of query (e.g. "全家便利商店" -> "全家")
+    first_tok = re.split(r"\s+", query.strip())[0].casefold()
+    for suffix in ("便利商店", "超商", "超市", "餐廳", "咖啡", "食堂"):
+        if first_tok.endswith(suffix) and len(first_tok) > len(suffix):
+            short_brand = first_tok[: -len(suffix)]
+            if len(short_brand) >= 2 and short_brand in t_norm:
+                return True
+    return False
+
+
+def search_serpapi_place(
+    api_key: str,
+    query: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    zoom: int = 15,
+    lang: str = "zh-tw",
+) -> Tuple[str, PlaceInfo, list[dict[str, Any]]]:
+    """Search Google Maps via SerpApi for a query (and optional coordinates) and return the best match."""
+    has_coords = lat is not None and lng is not None
+    cleaned_query = clean_search_query(query, has_coords=has_coords)
+    if not cleaned_query:
+        raise ValueError("Search query cannot be empty.")
+
+    params: dict[str, Any] = {
+        "api_key": api_key,
+        "engine": "google_maps",
+        "type": "search",
+        "q": cleaned_query,
+        "hl": (lang or "zh-tw").lower(),
+        "output": "json",
+    }
+    if has_coords and lat is not None and lng is not None:
+        params["ll"] = format_serpapi_ll(lat, lng, zoom)
+        log(f"Searching Google Maps: q='{cleaned_query}' near ({lat:.5f}, {lng:.5f})")
+    else:
+        log(f"Searching Google Maps: q='{cleaned_query}'")
+
+    payload = http_get_json(SERPAPI_ENDPOINT, params)
+
+    # Case 1: Exact single place match (place_results)
+    if isinstance(payload.get("place_results"), dict):
+        p_info = _parse_place_dict(payload["place_results"])
+        data_id = p_info.data_id or p_info.place_id
+        if data_id:
+            dist_m = None
+            if has_coords and lat is not None and lng is not None and p_info.latitude is not None and p_info.longitude is not None:
+                dist_m = haversine_distance_m(lat, lng, p_info.latitude, p_info.longitude)
+            cand = {
+                "name": p_info.name,
+                "address": p_info.address,
+                "rating": p_info.average_rating,
+                "total_reviews": p_info.total_reviews,
+                "data_id": data_id,
+                "distance_m": dist_m,
+            }
+            return data_id, p_info, [cand]
+
+    # Case 2: Multiple local search results (local_results)
+    raw_locals = payload.get("local_results")
+    if isinstance(raw_locals, list) and raw_locals:
+        valid_entries = [
+            e for e in raw_locals
+            if isinstance(e, dict) and (e.get("data_id") or e.get("place_id"))
+        ]
+        if valid_entries:
+            organic_entries = [e for e in valid_entries if not e.get("sponsored")]
+            pool = organic_entries or valid_entries
+
+            parsed_pool: list[Tuple[int, PlaceInfo, str, Optional[int]]] = []
+            for idx, entry in enumerate(pool):
+                p_info = _parse_place_dict(entry)
+                cid = str(p_info.data_id or p_info.place_id)
+                dist_m = None
+                if (
+                    has_coords
+                    and lat is not None
+                    and lng is not None
+                    and p_info.latitude is not None
+                    and p_info.longitude is not None
+                ):
+                    dist_m = haversine_distance_m(lat, lng, p_info.latitude, p_info.longitude)
+                parsed_pool.append((idx, p_info, cid, dist_m))
+
+            # Select the best match:
+            # When user coordinates are provided and one or more results match the store/brand name
+            # (e.g., searching "附近的全家便利商店" returns several FamilyMart branches), pick the
+            # closest matching store by physical distance. Otherwise use Google's top relevance rank.
+            chosen = parsed_pool[0]
+            if has_coords:
+                name_matched_with_dist = [
+                    item for item in parsed_pool
+                    if item[3] is not None and _query_matches_title(cleaned_query, item[1].name)
+                ]
+                if name_matched_with_dist:
+                    name_matched_with_dist.sort(key=lambda item: (item[3] if item[3] is not None else 10**9, item[0]))
+                    chosen = name_matched_with_dist[0]
+
+            # Build top candidate list with chosen first
+            ordered = [chosen] + [item for item in parsed_pool if item[2] != chosen[2]]
+            candidates: list[dict[str, Any]] = []
+            for _, p_item, cid_item, dist_item in ordered[:5]:
+                candidates.append({
+                    "name": p_item.name,
+                    "address": p_item.address,
+                    "rating": p_item.average_rating,
+                    "total_reviews": p_item.total_reviews,
+                    "data_id": cid_item,
+                    "distance_m": dist_item,
+                })
+
+            return chosen[2], chosen[1], candidates
+
+    raise ValueError(f"No matching Google Maps place found for query: '{cleaned_query}'")
 
 
 def parse_raw_reviews(payload: dict) -> list[Review]:
@@ -743,6 +1242,7 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
     """Format pipeline result into a structured Markdown digest for CLI, MCP, and LangChain."""
     p = result.get("place") or {}
     s = result.get("stats") or {}
+    search_meta = result.get("search") or {}
     target_lang = str(s.get("preferred_summary_language") or "en")
     is_zh = target_lang.lower().startswith("zh")
 
@@ -753,6 +1253,40 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
         rating_str = f"⭐ {avg_rating:.1f}" if avg_rating is not None else "⭐ N/A"
 
     lines = [f"# {p.get('name') or 'Google Maps Place'}"]
+    if search_meta:
+        q_display = search_meta.get("cleaned_query") or search_meta.get("query") or ""
+        dist_m = search_meta.get("matched_distance_m")
+        lat_v = search_meta.get("latitude")
+        lng_v = search_meta.get("longitude")
+        if is_zh:
+            loc_str = ""
+            if dist_m is not None:
+                loc_str = f" | 距離座標約 {dist_m} 公尺"
+            elif lat_v is not None and lng_v is not None:
+                loc_str = f" | 搜尋座標: {lat_v:.4f}, {lng_v:.4f}"
+            lines.append(f"🔍 搜尋匹配: 「{q_display}」最佳符合店家{loc_str}")
+        else:
+            loc_str = ""
+            if dist_m is not None:
+                loc_str = f" | ~{dist_m}m from coordinates"
+            elif lat_v is not None and lng_v is not None:
+                loc_str = f" | Search coords: {lat_v:.4f}, {lng_v:.4f}"
+            lines.append(f"🔍 Search Match: Best match for \"{q_display}\"{loc_str}")
+
+        cands = search_meta.get("candidates") or []
+        if len(cands) > 1:
+            alt_parts: list[str] = []
+            for idx, c in enumerate(cands[1:4], 2):
+                c_name = c.get("name") or "Unknown"
+                c_rating = f"⭐{c['rating']:.1f}" if c.get("rating") is not None else ""
+                c_dist = f"{c['distance_m']}m" if c.get("distance_m") is not None else ""
+                meta_items = [x for x in (c_rating, c_dist) if x]
+                meta_str = f" ({', '.join(meta_items)})" if meta_items else ""
+                alt_parts.append(f"{idx}. {c_name}{meta_str}")
+            if alt_parts:
+                alt_label = "📌 其他相近候選" if is_zh else "📌 Other Candidates"
+                lines.append(f"{alt_label}: {' | '.join(alt_parts)}")
+
     if p.get("address"):
         lines.append(f"📍 {'地址' if is_zh else 'Address'}: {p['address']}")
     if is_zh:
@@ -846,35 +1380,117 @@ def _cache_save(path: str, result: dict) -> None:
         log(f"Cache write warning: {exc}")
 
 
+def _merge_place_info(primary: PlaceInfo, secondary: PlaceInfo) -> PlaceInfo:
+    """Merge two PlaceInfo instances, preferring non-empty fields from primary."""
+    return PlaceInfo(
+        name=primary.name or secondary.name,
+        address=primary.address or secondary.address,
+        latitude=primary.latitude if primary.latitude is not None else secondary.latitude,
+        longitude=primary.longitude if primary.longitude is not None else secondary.longitude,
+        types=primary.types or secondary.types,
+        rating_summary=primary.rating_summary or secondary.rating_summary,
+        average_rating=primary.average_rating if primary.average_rating is not None else secondary.average_rating,
+        total_reviews=primary.total_reviews if primary.total_reviews is not None else secondary.total_reviews,
+        data_id=primary.data_id or secondary.data_id,
+        place_id=primary.place_id or secondary.place_id,
+    )
+
+
 def run_pipeline(
-    raw_input: str,
-    api_key: str,
+    raw_input: str = "",
+    api_key: str = "",
     preferred_lang: str = "zh-TW",
     use_cache: bool = True,
     sort_by: str = "qualityScore",
     save_quota: bool = False,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    ll: Optional[str] = None,
+    zoom: int = 15,
+    image_path: Optional[str] = None,
 ) -> dict:
-    """Full execution pipeline."""
+    """Full execution pipeline supporting Google Maps URLs, keyword/nearby search, and photos."""
     canonical_sort = normalize_sort_by(sort_by)
     if not save_quota and os.getenv("TLDREVIEW_SAVE_QUOTA", "").strip().lower() in {"1", "true", "yes"}:
         save_quota = True
 
-    # 1. Extract URL
-    url = extract_google_maps_url(raw_input)
-    if not url:
-        raise ValueError(f"No valid Google Maps URL found in input: {raw_input}")
+    # 0. Normalize coordinates from ll string or image EXIF GPS if present
+    if ll and (lat is None or lng is None):
+        parsed_ll = parse_ll_string(ll)
+        if not parsed_ll:
+            raise ValueError(f"Invalid coordinate string for ll: '{ll}'")
+        lat, lng = parsed_ll[0], parsed_ll[1]
+        if parsed_ll[2] is not None:
+            zoom = parsed_ll[2]
 
-    # 2. Resolve redirects
-    resolved_url = resolve_short_url(url)
+    if image_path:
+        if lat is None or lng is None:
+            exif_coords = extract_exif_gps(image_path)
+            if exif_coords:
+                lat, lng = exif_coords
+                log(f"Extracted EXIF GPS coordinates from image: ({lat}, {lng})")
+        if not (raw_input or "").strip():
+            ocr_data = extract_query_from_image(image_path)
+            raw_input = str(ocr_data.get("search_query") or "").strip()
+            log(f"Recognized store query from image: '{raw_input}'")
 
-    # 3. Extract data_id
-    data_id = extract_maps_data_id(resolved_url)
+    text_input = (raw_input or "").strip()
+    if not text_input:
+        raise ValueError("No Google Maps URL, store name, or search query provided.")
+
+    # 1. Check for Google Maps URL vs Keyword / Nearby Search
+    url = extract_google_maps_url(text_input)
+    resolved_url: Optional[str] = None
+    data_id: Optional[str] = None
+    searched_place_info: Optional[PlaceInfo] = None
+    search_meta: Optional[dict[str, Any]] = None
+    fallback_query: Optional[str] = None
+
+    if url:
+        resolved_url = resolve_short_url(url)
+        data_id = extract_maps_data_id(resolved_url)
+        if not data_id:
+            url_coords = extract_coordinates(resolved_url)
+            if url_coords and (lat is None or lng is None):
+                lat, lng = url_coords
+            outside_text = text_input.replace(url, " ").strip()
+            fallback_query = outside_text or extract_search_query_from_maps_url(resolved_url)
+            if not fallback_query:
+                if url_coords:
+                    raise ValueError(
+                        f"URL contains coordinates ({url_coords}) but no place data_id. "
+                        "Please provide a store name or use a full place share link."
+                    )
+                raise ValueError(f"Unable to extract data_id or coordinates from URL: {resolved_url}")
+
     if not data_id:
-        # Fallback: try coordinates or raise
-        coords = extract_coordinates(resolved_url)
-        if not coords:
-            raise ValueError(f"Unable to extract data_id or coordinates from URL: {resolved_url}")
-        raise ValueError(f"URL contains coordinates ({coords}) but no place data_id. Please use full share link.")
+        query_str = fallback_query if url else text_input
+        if lat is None or lng is None:
+            query_str, inline_coords = extract_inline_coordinates(query_str)
+            if inline_coords:
+                lat, lng = inline_coords
+        if not query_str:
+            raise ValueError(f"No valid Google Maps URL or place search query found in input: {raw_input}")
+
+        cleaned_q = clean_search_query(query_str, has_coords=(lat is not None and lng is not None))
+        data_id, searched_place_info, candidates = search_serpapi_place(
+            api_key=api_key,
+            query=query_str,
+            lat=lat,
+            lng=lng,
+            zoom=zoom,
+            lang=preferred_lang,
+        )
+        matched_dist = candidates[0].get("distance_m") if candidates else None
+        search_meta = {
+            "query": text_input,
+            "cleaned_query": cleaned_q,
+            "latitude": lat,
+            "longitude": lng,
+            "image_path": image_path,
+            "matched_distance_m": matched_dist,
+            "candidates": candidates,
+        }
 
     log(f"Target data_id: {data_id}")
 
@@ -884,14 +1500,27 @@ def run_pipeline(
             _cache_path(data_id, preferred_lang, sort_by=canonical_sort)
         )
         if cached:
-            log("Cache hit (< 24h) - skipping SerpApi calls")
+            log("Cache hit (< 24h) - skipping SerpApi review calls")
             cached["cached"] = True
             if isinstance(cached.get("stats"), dict):
                 cached["stats"]["preferred_summary_language"] = preferred_lang
+            if search_meta:
+                cached["search"] = search_meta
             return cached
 
-    # 4. Fetch place details (skipped in save_quota mode when data_id is directly usable)
-    if save_quota and is_reviews_ready_id(data_id):
+    # 4. Fetch place details (skipped when save_quota is active or search already returned full info)
+    if searched_place_info is not None:
+        if save_quota or searched_place_info.rating_summary:
+            place_info = searched_place_info
+        else:
+            details_info = fetch_serpapi_place_details(api_key, data_id)
+            place_info = _merge_place_info(details_info, searched_place_info)
+        official_lang = infer_language(place_info.address) if place_info.address else (preferred_lang or "en").lower()
+        log(f"Detected place: '{place_info.name or 'Unknown'}' in language '{official_lang}'")
+        review_id = data_id
+        if not is_reviews_ready_id(review_id):
+            review_id = place_info.data_id or place_info.place_id or data_id
+    elif save_quota and is_reviews_ready_id(data_id):
         log("Save-quota mode enabled: skipping place details call (1 SerpApi credit mode)")
         place_info = PlaceInfo()
         official_lang = (preferred_lang or "en").lower()
@@ -981,18 +1610,21 @@ def run_pipeline(
             log(f"English refetch warning: {exc}")
 
     if not reviews:
-        return {
+        no_rev_res: dict[str, Any] = {
             "status": "no_reviews",
             "message": "This location does not have any public reviews on Google Maps.",
             "data_id": data_id,
             "place": asdict(place_info),
         }
+        if search_meta:
+            no_rev_res["search"] = search_meta
+        return no_rev_res
 
     # 6. Curate and clip
     curated = curate_reviews(reviews)
     clipped = clip_reviews_for_prompt(curated)
 
-    result = {
+    result: dict[str, Any] = {
         "status": "success",
         "data_id": data_id,
         "resolved_url": resolved_url,
@@ -1027,6 +1659,8 @@ def run_pipeline(
             for r, text in clipped
         ],
     }
+    if search_meta:
+        result["search"] = search_meta
     _cache_save(cache_file, result)
     return result
 
@@ -1036,9 +1670,23 @@ def run_pipeline(
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Extract and curate Google Maps reviews for LLM summarization."
+        description=(
+            "Extract and curate Google Maps reviews from a URL, store/keyword query "
+            "(with optional coordinates), or signboard/menu photo."
+        )
     )
-    parser.add_argument("url", help="Google Maps link or text containing a Google Maps link")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default="",
+        help="Google Maps link, store name, address, or search query (e.g. '附近的全家便利商店')",
+    )
+    parser.add_argument("--query", "-q", help="Explicit search query (store name, keyword, or address)")
+    parser.add_argument("--lat", type=float, help="User current latitude for nearby search (e.g. 25.0330)")
+    parser.add_argument("--lng", "--lon", dest="lng", type=float, help="User current longitude for nearby search (e.g. 121.5654)")
+    parser.add_argument("--ll", help="Coordinates in '@lat,lng,15z' or 'lat,lng' format")
+    parser.add_argument("--zoom", type=int, default=15, help="Map zoom level when searching with coordinates (default: 15)")
+    parser.add_argument("--image", help="Path to a photo of a store signboard, menu, or business card")
     parser.add_argument("--api-key", help="SerpApi API Key (or set SERPAPI_API_KEY in environment / .env)")
     parser.add_argument("--lang", default="zh-TW", help="Preferred summary language code (default: zh-TW)")
     parser.add_argument(
@@ -1049,28 +1697,52 @@ def main() -> int:
     parser.add_argument(
         "--save-quota",
         action="store_true",
-        help="Consume only 1 SerpApi call per place by skipping place details and multi-page/English refetches",
+        help="Minimize SerpApi credit usage by skipping extra detail/pagination/English refetch calls",
     )
     parser.add_argument("--markdown", action="store_true", help="Output high-density human/LLM-readable Markdown")
     parser.add_argument("--no-cache", action="store_true", help="Ignore the 24h review cache and force fresh SerpApi calls")
-    parser.add_argument("--parse-only", action="store_true", help="Only parse URL and data_id without calling SerpApi")
+    parser.add_argument("--parse-only", action="store_true", help="Only parse URL, query, or EXIF GPS without calling SerpApi")
 
     args = parser.parse_args()
+    raw_target = (args.query if args.query is not None else args.url) or ""
 
     # Parse only mode
     if args.parse_only:
-        raw_url = extract_google_maps_url(args.url)
-        if not raw_url:
-            print(json.dumps({"error": "No Google Maps URL found in input"}), file=sys.stdout)
+        raw_url = extract_google_maps_url(raw_target)
+        exif_coords = extract_exif_gps(args.image) if args.image else None
+        if raw_url:
+            resolved = resolve_short_url(raw_url)
+            data_id = extract_maps_data_id(resolved)
+            coords = extract_coordinates(resolved) or exif_coords
+            print(json.dumps({
+                "mode": "url",
+                "original_url": raw_url,
+                "resolved_url": resolved,
+                "data_id": data_id,
+                "coordinates": coords,
+            }, indent=2, ensure_ascii=False), file=sys.stdout)
+            return 0
+
+        lat, lng = args.lat, args.lng
+        if args.ll and (lat is None or lng is None):
+            parsed_ll = parse_ll_string(args.ll)
+            if parsed_ll:
+                lat, lng = parsed_ll[0], parsed_ll[1]
+        if (lat is None or lng is None) and exif_coords:
+            lat, lng = exif_coords
+        cleaned_text, inline_coords = extract_inline_coordinates(raw_target)
+        if (lat is None or lng is None) and inline_coords:
+            lat, lng = inline_coords
+        cleaned_q = clean_search_query(cleaned_text, has_coords=(lat is not None and lng is not None))
+        if not cleaned_q and not exif_coords:
+            print(json.dumps({"error": "No Google Maps URL, search query, or image found in input"}), file=sys.stdout)
             return 1
-        resolved = resolve_short_url(raw_url)
-        data_id = extract_maps_data_id(resolved)
-        coords = extract_coordinates(resolved)
         print(json.dumps({
-            "original_url": raw_url,
-            "resolved_url": resolved,
-            "data_id": data_id,
-            "coordinates": coords
+            "mode": "search",
+            "raw_query": raw_target,
+            "cleaned_query": cleaned_q,
+            "coordinates": [lat, lng] if (lat is not None and lng is not None) else None,
+            "image": args.image,
         }, indent=2, ensure_ascii=False), file=sys.stdout)
         return 0
 
@@ -1084,12 +1756,17 @@ def main() -> int:
 
     try:
         result = run_pipeline(
-            args.url,
+            raw_target,
             api_key,
             preferred_lang=args.lang,
             use_cache=not args.no_cache,
             sort_by=args.sort_by,
             save_quota=args.save_quota,
+            lat=args.lat,
+            lng=args.lng,
+            ll=args.ll,
+            zoom=args.zoom,
+            image_path=args.image,
         )
     except Exception as exc:
         safe_err = _redact_api_key(str(exc), api_key)

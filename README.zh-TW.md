@@ -10,18 +10,34 @@
 🌐 **[專案官網 (Official Website)](https://tldreview.app/)**
 
 [![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
+[![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)](#-版本更新紀錄-whats-new)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-tldreview-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/tldreview)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
 
 ---
 
+## 🆕 版本更新紀錄 (What's New)
+
+### 🎉 v1.1.0
+- 📍 **新增「附近店家」與口語關鍵字搜尋**：除了貼上 Google Maps 網址外，現在支援直接說出「*附近的全家便利商店*」或店名關鍵字。AI Agent 可自動取得使用者目前座標（`--lat`、`--lng`），過濾贊助廣告並計算直線距離，自動鎖定最符合的最近分店並切入評論分析。
+- 📸 **新增「店家招牌／菜單照片」查詢**：支援傳送帶有店名或地址的照片（如店門招牌、菜單、名片或門牌）。結合 AI 視覺辨識與內建零依賴 EXIF GPS 座標提取（`--image`），自動識別店名與地址直入該店評論。
+- 🧩 **全平台 Agent 與工具鏈同步升級**：全面更新 Core CLI、MCP Server、LangChain `@tool`、xAI Grok Bot、Meta Muse 與 Master System Prompt，完整支援三種查詢模式。
+
+---
+
 ## 🦊 TL;DReview 是什麼？
 
-**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。貼上 Google Maps 網址，它就會從數百則又長又雜的評論中，整理出一份結構化報告：**必點招牌、優點、缺點與避雷、內行人祕笈、營運規則、交通停車**，讓你在出發前就掌握一個地點的完整細節。
+**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。支援 **三種直覺查詢方式**：
+1. 🔗 **貼上 Google Maps 網址**（含短網址與社群跳轉連結）
+2. 📍 **直接說「附近的店家」**（例如：「*附近的全家便利商店*」——由 AI Agent 取得你目前的座標，自動搜尋並切入最符合結果的店家評論）
+3. 📸 **傳送店家招牌或菜單照片**（拍下店門招牌、菜單、名片或門牌地址，自動辨識店名／地址並直入該店評論）
+
+無論哪種方式，它都會從數百則又長又雜的評論中，整理出一份結構化報告：**必點招牌、優點、缺點與避雷、內行人祕笈、營運規則、交通停車**，讓你在出發前就掌握一個地點的完整細節。
 
 ---
 
@@ -46,7 +62,7 @@ TL;DReview 會從眾多評論中過濾、整理出該地點的**優點、缺點�
 
 | 環節 | 直接把網址丟給一般 AI | 使用 🦊 TL;DReview Skill |
 | :--- | :--- | :--- |
-| **1. 網址解析** | 短網址（`maps.app.goo.gl`）與跳轉頁面常無法解析，或誤抓網址內周邊地標的 ID。 | 自動解開短網址、IG 跳轉包裝與歐盟 Consent 攔截頁，精準分離出真正的店家 `CID / Place ID`。 |
+| **1. 網址與定位搜尋** | 短網址（`maps.app.goo.gl`）常無法解析，且無法精準結合座標鎖定最近分店。 | 自動解開短網址與跳轉頁；支援**座標搜尋（如「附近的全家」）**與**招牌／菜單照片辨識**直入最符合店家。 |
 | **2. 評論讀取** | Google Maps 評論由前端 JS 動態渲染且有防爬蟲限制，AI 內建瀏覽器只看得到空殼 HTML，**根本讀不到半則評論**。 | 透過結構化 API 直連，穩定抓取完整評論內文、發布時間、按讚數與 1~5 星分布數據。 |
 | **3. 真實性與幻覺** | 讀不到評論時，AI 會偷偷去搜過時的「部落客業配食記」，甚至看店名**直接自行腦補菜色與口感**。 | **100% 綁定真實顧客評論證據（Evidence-Only）**，評論未提及的維度直接整段省略，絕不硬湊。 |
 | **4. 評論品質過濾** | 就算手動複製貼上，前排也常被無意義短評或 5 年前的過時評價洗版，缺乏代表性。 | 演算法自動剔除 2 年前過期評論、優先提權**「在地嚮導 (Local Guides)」**、強制保留 **★1~★3 低星避雷負評**。 |
@@ -55,9 +71,10 @@ TL;DReview 會從眾多評論中過濾、整理出該地點的**優點、缺點�
 
 ### 🔧 TL;DReview 在背後幫你處理了哪些技術細節？
 
-1. **🔗 Google Maps 短網址還原與精準 ID 剝離（URL Unwrapping & ID Disambiguation）**
-   - 從手機 Google Maps App 分享出來的連結通常是 `maps.app.goo.gl/...`、`share.google/...`，或是從社群複製的 `l.instagram.com/?u=...` 包裝網址，甚至在部分雲端節點會被 `consent.google.com` 攔截。
-   - 即使展開成長網址，Google Maps 參數（`data=!4m6!3m5...`）中也常同時混雜「連入來源地標（`!5s0x...`）」與「真正目標店家（`!1s0x...`）」的多組十六進位碼。本工具內建專用解析器，能優先鎖定 `!1s` CID、轉換十進位 `data_cid`、或提取 `ChI...` Place ID 與 `/g/...` 知識圖譜 ID，確保不會抓錯店。
+1. **🔗 多元入口：短網址精準剝離 ＋ 座標附近搜尋 ＋ 招牌／菜單照片辨識**
+   - **短網址與 ID 剝離**：自動解開 `maps.app.goo.gl/...`、`share.google/...`、`l.instagram.com/?u=...` 與 `consent.google.com`，並在複雜參數中優先鎖定真正目標店家 `!1s` CID（避開 `!5s` 來源地標）。
+   - **「附近店家」座標搜尋**：當你直接對 AI 說「*附近的全家便利商店*」時，AI Agent 可取得你目前的經緯度座標（`--lat`、`--lng`），透過 Google Maps 搜尋並按品牌名稱與直線距離（Haversine Distance）自動鎖定離你最近、最符合的分店，直接進入該店評論。
+   - **招牌與菜單照片查詢**：傳送店門口的**招牌、菜單、名片或門牌照片**時，結合 AI 視覺辨識（Vision OCR）與照片內建 EXIF GPS 座標提取（`--image`），自動組合店名與地址切入最符合店家的評論。
 
 2. **🧹 評論良莠不齊的多階段清洗演算法（Representative Curation）**
    - Google Maps 原始評論良莠不齊，充斥著好幾年前（甚至換老闆前）的過期評論，以及只有「好吃」「推」的無意義短評。
@@ -98,11 +115,13 @@ TL;DReview 會從眾多評論中過濾、整理出該地點的**優點、缺點�
 
 ```mermaid
 graph TD
-    User([使用者傳送 Google Maps 網址]) --> Agent[AI Agent / Grok / Muse / Claude]
+    U1([🔗 傳送 Google Maps 網址]) --> Agent[AI Agent / Grok / Muse / Claude]
+    U2([📍 口語說「附近的全家」+ 取得座標]) --> Agent
+    U3([📸 傳送店家招牌／菜單照片]) --> Agent
     Agent --> Core[core/tldreview_tool.py]
-    Core --> ShortURL[短網址解析 & CID 提取]
-    Core --> SerpApi[SerpApi 抓取最新與高權重評論]
-    Core --> Filter[評論篩選、防爆 Token 密度壓縮]
+    Core --> Resolve[短網址解析 / 座標與店名最佳匹配鎖定]
+    Resolve --> SerpApi[SerpApi 抓取最新與高權重評論]
+    SerpApi --> Filter[評論篩選、防爆 Token 密度壓縮]
     Filter --> Prompt[prompts/SYSTEM_PROMPT.zh-TW.md]
     Prompt --> Output[🦊 深度避雷與推薦報告]
 ```
@@ -180,10 +199,19 @@ TL;DReview 透過 [SerpApi](https://serpapi.com/) 抓取 Google Maps 評論，�
 # 1. 設定 SerpApi API Key（可 export 環境變數，或直接複製 .env.example 為 .env 填入）
 export SERPAPI_API_KEY="your_api_key_here"
 
-# 2. 直接執行核心腳本（零依賴，免安裝任何第三方套件）
+# 2A. 直接傳入 Google Maps 網址（零依賴，免安裝任何第三方套件）
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --markdown
 
-# 進階選項：指定排序（newest / lowest / highest）或開啟省額度模式（--save-quota，每次僅耗 1 點額度）
+# 2B. 「附近店家」座標查詢（自動鎖定最符合且最近的店家並抓取評論）
+python3 core/tldreview_tool.py "附近的全家便利商店" --lat 25.0330 --lng 121.5654 --markdown
+
+# 2C. 店名／地址查詢（或由 AI Agent 辨識店家招牌／菜單照片後傳入）
+python3 core/tldreview_tool.py "老張牛肉麵 台北市大安區" --markdown
+
+# 2D. 直接傳入店家招牌／菜單照片（自動提取照片 EXIF GPS 座標，若設 GEMINI_API_KEY 可自動 OCR 店名）
+python3 core/tldreview_tool.py --image ./signboard.jpg --markdown
+
+# 進階選項：指定排序（newest / lowest / highest）或開啟省額度模式（--save-quota）
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --sort-by newest --save-quota --markdown
 
 # 或輸出給其他程式使用的 JSON
@@ -191,7 +219,7 @@ python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample"
 
 # （選用）安裝為全域 CLI 指令 `tldreview`
 pip install -e .
-tldreview "https://maps.app.goo.gl/sample" --markdown
+tldreview "附近的全家便利商店" --lat 25.0330 --lng 121.5654 --markdown
 ```
 
 ---
@@ -200,6 +228,15 @@ tldreview "https://maps.app.goo.gl/sample" --markdown
 
 想為其他 Agent（如 OpenAI Custom GPTs、Discord Bot、Telegram Bot 等）建立 Adapter？  
 歡迎閱讀 [CONTRIBUTING.zh-TW.md](CONTRIBUTING.zh-TW.md) 提交 PR！
+
+---
+
+## ☕ 贊助支持 (Sponsor)
+
+如果 **TL;DReview** 幫你省下了翻閱評論的時間、成功避開地雷店，歡迎請我們喝杯咖啡支持專案持續開發：  
+👉 **[Buy Me a Coffee (https://buymeacoffee.com/tldreview)](https://buymeacoffee.com/tldreview)**
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support%20TL%3BDReview-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/tldreview)
 
 ---
 
