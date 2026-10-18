@@ -40,10 +40,10 @@ Your mission is to resolve any user place query—whether from a **Google Maps U
    - When the user asks an open-ended discovery question (e.g., *"What's the best ramen near me without fake reviews?"*), run `python3 core/tldreview_tool.py "ramen" --lat <lat> --lng <lng> --top 3 --markdown`.
    - The CLI runs 1 LBS search, strips out `Sponsored` ads, fetches & audits the top 3 highest-rated candidates in parallel, and helps you crown the **🏆 True Organic Winner**.
 
-6. **🔒 Mode 6: Zero-Knowledge E2EE Personal Dining Vault (`--vault-save` & `--vault-query`)**
+6. **🔒 Mode 6: Zero-Knowledge E2EE Personal Dining Vault (`--vault-save` / `--vault-query` / `--vault-escrow` / `--vault-recover`)**
    - **Memory-First Lookup**: Whenever the user asks about their saved restaurants, pocket list, or asks *"Is there anything on my wishlist nearby?"*, **query their Vault FIRST** (`python3 core/tldreview_tool.py --vault-query --status wishlist --lat <lat> --lng <lng> --radius-km 5.0 --markdown` or `tldreview_vault_query`). Vault queries run locally with Haversine distance filtering and consume **0 SerpApi credits**!
    - **Upsert & Status Transitions (`--vault-save`)**: When the user wants to bookmark a place (`wishlist`), mark a place they visited and loved (`liked`), or blacklist a place (`disliked`), run `--vault-save` (or `tldreview_vault_save`) with the distilled `--must-try`, `--red-flags`, `--insider-tips`, and `--tags`.
-   - **First-Time Key Preservation (`TLDREVIEW_SYNC_KEY`)**: On the user's very first save, if the tool auto-generates and prints a new `TLDREVIEW_SYNC_KEY` (`tld_<vault_id>_<master_secret>`), **you MUST display the key clearly to the user and save it in your AI Agent Memory**, enabling seamless zero-knowledge sync across ephemeral cloud sandboxes.
+   - **Passphrase Escrow & Key Recovery**: On first save, proactively offer to set a memorable recovery passphrase (`--vault-escrow --passphrase "<user's sentence>"`) and store `TLDREVIEW_SYNC_KEY` in your Agent Memory. If a VM resets or the user switches devices, run `--vault-recover --passphrase "<user's sentence>"` to restore the key and all saved places; use `--vault-status` for connectivity diagnostics or `--vault-export` / `--vault-import` for JSON backups.
    - **Post-Digest Nudge**: After presenting a single-venue review digest, append a brief 1-line note reminding the user they can save the place to their `wishlist` or mark it as `liked` / `disliked`.
 
 ---

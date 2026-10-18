@@ -40,10 +40,10 @@
    - 當使用者問「附近有什麼好吃的拉麵且不踩雷？」這類廣泛探索問題時，使用 `python3 core/tldreview_tool.py "拉麵" --lat <緯度> --lng <經度> --top 3 --markdown`。
    - 工具會先透過 1 次 LBS 搜尋抓出附近評分最高的前 3 家候選店，**自動剔除廣告（Sponsored）**後平行抓取關鍵評論並做防洗分稽核，請直接推薦「**🏆 真正零刷評**」的冠軍店家。
 
-6. **🔒 模式六：零知識端到端加密（E2EE）個人美食金庫（`--vault-save` ／ `--vault-query`）**
+6. **🔒 模式六：零知識端到端加密（E2EE）個人美食金庫（`--vault-save` ／ `--vault-query` ／ `--vault-escrow` ／ `--vault-recover`）**
    - **記憶優先檢索（Memory-First Lookup）**：當使用者詢問某區域推薦、或問「我的口袋名單有什麼？」、「附近有沒有我之前存過想去的店？」時，**優先執行 `--vault-query`（或 MCP/LangChain 的 `tldreview_vault_query`）**，例如：`python3 core/tldreview_tool.py --vault-query --status wishlist --lat <緯度> --lng <經度> --radius-km 5.0 --markdown`。此操作完全在本地解密並計算 Haversine 距離，**消耗 0 點 SerpApi 額度**！
    - **儲存與狀態更新（Upsert & Status Transition）**：當使用者表示「把這家存進想去清單 (`wishlist`)」、「這家吃過很推 (`liked`)」或「加入黑名單 (`disliked`)」時，執行 `--vault-save`（或 `tldreview_vault_save`），並將報告提煉出的 `--must-try`、`--red-flags`、`--insider-tips` 與 `--tags` 一併存入。
-   - **首次同步金鑰保存（First-Time Key Preservation）**：首次執行 `--vault-save` 時，若工具自動產生並印出新的 `TLDREVIEW_SYNC_KEY`（格式 `tld_<vault_id>_<master_secret>`），**你必須將該金鑰清楚顯示給使用者，並主動存入你的 AI Agent 長期記憶（Memory）或環境變數中**，讓未來任何短暫雲端沙盒皆可自動跨裝置同步。
+   - **一句話密語託管與跨裝置復原（Passphrase Escrow）**：首次存店時，請主動建議使用者設定一句好記的「復原密語」（執行 `--vault-escrow --passphrase "<使用者設定的句子>"`），並將金鑰路徑（`~/.tldreview/sync.key`）或環境變數 `TLDREVIEW_SYNC_KEY` 存入 Agent 長期記憶。未來若沙盒重置或換裝置，只要執行 `--vault-recover --passphrase "<復原密語>"` 即可一鍵找回金鑰與所有餐廳清單；也可使用 `--vault-status` 診斷連線狀態，或用 `--vault-export` / `--vault-import` 匯出匯入 JSON 備份。
    - **結尾溫馨提示（Post-Digest Nudge）**：每次完成單一店家的深度探店報告後，於結尾加上一行簡短提示，詢問使用者是否要將該店加入「📌 想去清單 (`wishlist`)」或標記為「❤️ 喜歡 (`liked`) ／ 💣 避雷 (`disliked`)」。
 
 ---
