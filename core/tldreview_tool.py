@@ -898,19 +898,83 @@ def fetch_serpapi_place_details(api_key: str, data_id: str) -> PlaceInfo:
     return _parse_place_dict(core if isinstance(core, dict) else {})
 
 
+_CN_DIGITS = {
+    "零": 0, "〇": 0,
+    "一": 1, "壹": 1,
+    "二": 2, "兩": 2, "貳": 2,
+    "三": 3, "參": 3, "叁": 3,
+    "四": 4, "肆": 4,
+    "五": 5, "伍": 5,
+    "六": 6, "陸": 6,
+    "七": 7, "柒": 7,
+    "八": 8, "捌": 8,
+    "九": 9, "玖": 9,
+}
+_CN_UNITS = {
+    "十": 10, "拾": 10,
+    "百": 100, "佰": 100,
+    "千": 1000, "仟": 1000,
+}
+_CN_NUM_SEQ_RE = re.compile(
+    r"[零〇一二兩三四五六七八九十百千壹貳參叁肆伍陸柒捌玖拾佰仟]+"
+)
+
+
+def _cn_numerals_to_arabic(text: str) -> str:
+    """Convert Chinese numeral sequences in store names (e.g. '五十嵐' -> '50嵐', '八十五度C' -> '85度C')."""
+    if not text:
+        return ""
+
+    def _replace_seq(match: re.Match) -> str:
+        seq = match.group(0)
+        # If no positional unit (十/百/千), convert digit-by-digit (e.g. '八五' -> '85', '一零一' -> '101')
+        if not any(ch in _CN_UNITS for ch in seq):
+            return "".join(str(_CN_DIGITS[ch]) for ch in seq if ch in _CN_DIGITS)
+
+        total = 0
+        current = 0
+        has_leading_unit = False
+        for ch in seq:
+            if ch in _CN_DIGITS:
+                current = _CN_DIGITS[ch]
+                has_leading_unit = True
+            elif ch in _CN_UNITS:
+                unit = _CN_UNITS[ch]
+                if current == 0 and not has_leading_unit:
+                    current = 1
+                total += current * unit
+                current = 0
+                has_leading_unit = True
+        total += current
+        return str(total)
+
+    return _CN_NUM_SEQ_RE.sub(_replace_seq, text)
+
+
+def _normalize_for_match(text: str) -> str:
+    """Normalize store names for matching (Chinese numerals, degree symbols, 7-ELEVEN aliases, etc.)."""
+    s = text.casefold().replace("臺", "台")
+    s = s.replace("℃", "度c").replace("°c", "度c").replace("ºc", "度c")
+    s = re.sub(r"7[\s\-_]*eleven", "711", s)
+    s = _cn_numerals_to_arabic(s)
+    s = s.replace("小7", "711")
+    s = re.sub(r"[\s\-_・店分號門市]+", "", s)
+    return s
+
+
 def _query_matches_title(query: str, title: Optional[str]) -> bool:
     """Check if the place title matches the core store name in the query."""
     if not query or not title:
         return False
-    q_norm = re.sub(r"[\s\-_・店分號]+", "", query.casefold())
-    t_norm = re.sub(r"[\s\-_・店分號]+", "", title.casefold())
+    q_norm = _normalize_for_match(query)
+    t_norm = _normalize_for_match(title)
     if not q_norm or not t_norm:
         return False
     if q_norm in t_norm or t_norm in q_norm:
         return True
     # Also check first token of query (e.g. "全家便利商店" -> "全家")
-    first_tok = re.split(r"\s+", query.strip())[0].casefold()
-    for suffix in ("便利商店", "超商", "超市", "餐廳", "咖啡", "食堂"):
+    first_tok = _normalize_for_match(re.split(r"\s+", query.strip())[0])
+    for suffix in ("便利商店", "超商", "超市", "餐廳", "咖啡", "食堂", "茶飲", "專賣"):
         if first_tok.endswith(suffix) and len(first_tok) > len(suffix):
             short_brand = first_tok[: -len(suffix)]
             if len(short_brand) >= 2 and short_brand in t_norm:

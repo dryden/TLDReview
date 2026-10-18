@@ -382,6 +382,69 @@ class TestTLDReviewCore(unittest.TestCase):
             self.assertIn("🔍 搜尋匹配: 「全家便利商店」最佳符合店家", md)
             self.assertIn("📌 其他相近候選: 2. 全家便利商店 台北遠距店", md)
 
+    def test_chinese_numeral_store_name_matching_like_50lan_and_85c(self) -> None:
+        from core.tldreview_tool import _cn_numerals_to_arabic, _query_matches_title
+
+        self.assertEqual(_cn_numerals_to_arabic("五十嵐"), "50嵐")
+        self.assertEqual(_cn_numerals_to_arabic("八十五度C"), "85度C")
+        self.assertEqual(_cn_numerals_to_arabic("八五度C"), "85度C")
+        self.assertEqual(_cn_numerals_to_arabic("台北一零一"), "台北101")
+
+        self.assertTrue(_query_matches_title("五十嵐", "50嵐 裕民店"))
+        self.assertTrue(_query_matches_title("八十五度C", "85°C 咖啡蛋糕烘焙專賣店"))
+        self.assertTrue(_query_matches_title("八五度C", "85度C 板橋店"))
+        self.assertTrue(_query_matches_title("小七", "7-ELEVEN 裕民門市"))
+        self.assertTrue(_query_matches_title("7-11", "7-ELEVEN 裕民門市"))
+
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        sample_reviews = [
+            Review(author="TeaLover", text="一號珍波椰四季春微糖微冰超讚", rating=5.0, published_at=recent_iso, review_id="50_1")
+        ]
+        search_payload = {
+            "local_results": [
+                {
+                    "title": "50嵐 四川店",
+                    "address": "新北市板橋區四川路, 台灣",
+                    "data_id": "0x3442a:0xfar50lan",
+                    "rating": 4.2,
+                    "reviews": 300,
+                    "type": "冰品飲料店",
+                    "gps_coordinates": {"latitude": 25.0020, "longitude": 121.4600},
+                },
+                {
+                    "title": "50嵐 裕民店",
+                    "address": "新北市板橋區裕民街, 台灣",
+                    "data_id": "0x3442a:0xnear50lan",
+                    "rating": 4.3,
+                    "reviews": 190,
+                    "type": "冰品飲料店",
+                    "gps_coordinates": {"latitude": 25.0200, "longitude": 121.4600},
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"TLDREVIEW_CACHE_DIR": tmpdir}
+        ), patch(
+            "core.tldreview_tool.http_get_json",
+            return_value=search_payload,
+        ), patch(
+            "core.tldreview_tool.fetch_serpapi_reviews",
+            return_value=(sample_reviews, 190, None, {}),
+        ):
+            res = run_pipeline(
+                "幫我查附近的五十嵐",
+                api_key="dummy_key",
+                preferred_lang="zh-TW",
+                use_cache=False,
+                save_quota=True,
+                lat=25.0190,
+                lng=121.4600,
+            )
+            self.assertEqual(res["place"]["name"], "50嵐 裕民店")
+            self.assertEqual(res["data_id"], "0x3442a:0xnear50lan")
+            self.assertLess(res["search"]["matched_distance_m"], 200)
+
     def test_exif_gps_extraction_and_signboard_image_pipeline(self) -> None:
         import struct
         from core.tldreview_tool import extract_exif_gps
