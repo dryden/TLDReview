@@ -516,6 +516,189 @@ class TestTLDReviewCore(unittest.TestCase):
                 self.assertEqual(res["search"]["cleaned_query"], "老張牛肉麵 愛國東路105號")
                 self.assertAlmostEqual(res["search"]["latitude"], 25.0330, places=4)
 
+    def test_zero_cost_metadata_and_cross_language_point_and_speak(self) -> None:
+        from core.tldreview_tool import _parse_place_dict, parse_raw_reviews
+
+        raw_place = {
+            "title": "焼肉 叙々苑 新宿中央東口店",
+            "address": "東京都新宿区新宿3-27-10, Japan",
+            "data_id": "0x60188c:0xabcdef123456",
+            "rating": 4.4,
+            "reviews": 980,
+            "type": "焼肉店",
+            "price": "¥10,000+",
+            "open_state": "営業中 ⋅ 営業終了: 22:30",
+            "service_options": {"dine_in": True, "takeout": True, "delivery": False},
+            "extensions": [
+                {"accessibility": ["無障礙入口"]},
+                {"payments": ["只收現金"]},
+            ],
+            "popular_times": {
+                "live_hash": {
+                    "info": "目前店內比平時擁擠",
+                    "time_spent": "平均停留 1.5 至 2 小時",
+                },
+                "graph_results": {
+                    "saturday": [
+                        {"time": "12:00", "busyness_score": 88, "info": "Busy"},
+                        {"time": "13:00", "busyness_score": 95, "info": "Peak"},
+                        {"time": "14:00", "busyness_score": 82, "info": "Busy"},
+                    ],
+                },
+            },
+            "photos": [
+                {"title": "Menu 菜單", "image": "https://example.com/menu_album_1.jpg"},
+            ],
+        }
+        p_info = _parse_place_dict(raw_place)
+        self.assertEqual(p_info.price, "¥10,000+")
+        self.assertEqual(p_info.open_state, "営業中 ⋅ 営業終了: 22:30")
+        self.assertIn("內用 (Dine-in)", p_info.service_options)
+        self.assertIn("只收現金", p_info.service_options)
+        self.assertEqual(p_info.popular_times["live_info"], "目前店內比平時擁擠")
+        self.assertEqual(p_info.popular_times["peak_hours"][0]["day_zh"], "週六")
+        self.assertEqual(p_info.popular_times["peak_hours"][0]["window"], "12:00–14:00")
+        self.assertEqual(p_info.menu_urls, ["https://example.com/menu_album_1.jpg"])
+
+        raw_reviews_payload = {
+            "reviews": [
+                {
+                    "user": {"name": "Kenji", "local_guide": True},
+                    "rating": 5,
+                    "iso_date": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat(),
+                    "snippet": "最新メニューと価格表です。炙り和牛握りが最高！",
+                    "images": ["https://example.com/latest_menu_2026.jpg"],
+                }
+            ]
+        }
+        parsed_revs = parse_raw_reviews(raw_reviews_payload)
+        self.assertEqual(parsed_revs[0].images, ["https://example.com/latest_menu_2026.jpg"])
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"TLDREVIEW_CACHE_DIR": tmpdir}
+        ), patch(
+            "core.tldreview_tool.fetch_serpapi_place_details",
+            return_value=p_info,
+        ), patch(
+            "core.tldreview_tool.fetch_serpapi_reviews",
+            return_value=(parsed_revs, 980, None, {}),
+        ):
+            res = run_pipeline(
+                "https://www.google.com/maps/place/Jojoen/data=!4m2!3m1!1s0x60188c:0xabcdef123456",
+                api_key="dummy_key",
+                preferred_lang="zh-TW",
+                use_cache=False,
+                save_quota=False,
+            )
+            self.assertTrue(res["stats"]["cross_language"])
+            self.assertEqual(
+                res["place"]["menu_urls"],
+                ["https://example.com/menu_album_1.jpg", "https://example.com/latest_menu_2026.jpg"],
+            )
+            md = format_markdown_output(res, include_agent_instructions=True)
+            self.assertIn("💰 均消/價位: ¥10,000+", md)
+            self.assertIn("🕒 營業狀態: 営業中", md)
+            self.assertIn("🛎️ 服務與設施:", md)
+            self.assertIn("⏳ 排隊與尖峰預警:", md)
+            self.assertIn("📋 最新菜單與價目圖片:", md)
+            self.assertIn("🗣️ 跨語系點餐手指卡已啟用", md)
+            self.assertIn("點餐手指卡", md)
+
+    def test_compare_and_top_discovery_pipelines(self) -> None:
+        from core.tldreview_tool import run_compare_pipeline, run_top_discovery_pipeline
+
+        recent_iso = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        clean_reviews = [
+            Review(author="LocalA", text="湯頭濃郁，叉燒厚實好吃！", rating=5.0, published_at=recent_iso, is_local_guide=True, review_id="c1"),
+            Review(author="LocalB", text="麵條硬度剛好，不用排隊太久。", rating=4.0, published_at=recent_iso, is_local_guide=True, review_id="c2"),
+        ]
+        manipulated_reviews = [
+            Review(author="Promo1", text="五星好評送飲料跟溏心蛋！", rating=5.0, published_at=recent_iso, review_id="m1"),
+            Review(author="Promo2", text="打卡送小菜，湯頭普通偏鹹。", rating=2.0, published_at=recent_iso, review_id="m2"),
+        ]
+
+        search_payload = {
+            "local_results": [
+                {
+                    "title": "廣告拉麵店 (Sponsored)",
+                    "address": "台北市大安區, 台灣",
+                    "data_id": "0x3442a:0xaaaa1111",
+                    "rating": 4.9,
+                    "reviews": 999,
+                    "sponsored": True,
+                },
+                {
+                    "title": "刷評拉麵店",
+                    "address": "台北市大安區忠孝東路, 台灣",
+                    "data_id": "0x3442a:0xbbbb2222",
+                    "rating": 4.8,
+                    "reviews": 500,
+                    "rating_summary": {"5": 350, "4": 50, "1": 100},
+                    "price": "$200–400",
+                    "open_state": "營業中",
+                },
+                {
+                    "title": "職人真實拉麵",
+                    "address": "台北市大安區仁愛路, 台灣",
+                    "data_id": "0x3442a:0xcccc3333",
+                    "rating": 4.6,
+                    "reviews": 420,
+                    "rating_summary": {"5": 280, "4": 120, "1": 5},
+                    "price": "$250–350",
+                    "open_state": "營業中",
+                },
+            ]
+        }
+
+        def fake_fetch_reviews(api_key, data_id, lang="zh-tw", page_token=None, sort_by="qualityScore"):
+            if "bbbb2222" in data_id:
+                return manipulated_reviews, 500, None, {}
+            return clean_reviews, 420, None, {}
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ, {"TLDREVIEW_CACHE_DIR": tmpdir}
+        ), patch(
+            "core.tldreview_tool.http_get_json",
+            return_value=search_payload,
+        ), patch(
+            "core.tldreview_tool.fetch_serpapi_reviews",
+            side_effect=fake_fetch_reviews,
+        ):
+            top_res = run_top_discovery_pipeline(
+                query="附近好吃的拉麵",
+                api_key="dummy_key",
+                top_n=2,
+                preferred_lang="zh-TW",
+                use_cache=False,
+                save_quota=True,
+                lat=25.0330,
+                lng=121.5654,
+            )
+            self.assertEqual(top_res["mode"], "top_discovery")
+            self.assertEqual(top_res["sponsored_removed"], 1)
+            self.assertEqual(len(top_res["places"]), 2)
+            # Even though 刷評拉麵店 has 4.8 raw rating vs 4.6, 職人真實拉麵 wins after anti-manipulation audit!
+            self.assertEqual(top_res["recommended_winner"]["name"], "職人真實拉麵")
+            md_top = format_markdown_output(top_res, include_agent_instructions=True)
+            self.assertIn("職人真實拉麵", md_top)
+            self.assertIn("已自動剔除 1 筆贊助廣告", md_top)
+
+            cmp_res = run_compare_pipeline(
+                targets=[
+                    "https://www.google.com/maps/place/A/data=!4m2!3m1!1s0x3442a:0xbbbb2222",
+                    "https://www.google.com/maps/place/B/data=!4m2!3m1!1s0x3442a:0xcccc3333",
+                ],
+                api_key="dummy_key",
+                preferred_lang="zh-TW",
+                use_cache=False,
+                save_quota=True,
+            )
+            self.assertEqual(cmp_res["mode"], "compare")
+            self.assertEqual(cmp_res["count"], 2)
+            self.assertEqual(cmp_res["token_budget_per_place"]["max_reviews"], 15)
+            md_cmp = format_markdown_output(cmp_res, include_agent_instructions=True)
+            self.assertIn("⚔️ 多店 PK 決策對比", md_cmp)
+
 
 if __name__ == "__main__":
     unittest.main()

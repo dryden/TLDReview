@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
@@ -56,6 +57,8 @@ MIN_TOTAL_FOR_EN_REFETCH = 10
 MAX_REVIEWS_FOR_LLM = 30
 MAX_TOTAL_REVIEW_CHARS = 8000
 MAX_SINGLE_REVIEW_CHARS = 1200
+COMPARE_MAX_REVIEWS_PER_PLACE = 15
+COMPARE_MAX_CHARS_PER_PLACE = 4000
 NEXT_PAGE_THRESHOLD = 500
 ELLIPSIS = "…"
 
@@ -189,6 +192,7 @@ class Review:
     is_local_guide: Optional[bool] = None
     like_count: Optional[int] = None
     review_id: Optional[str] = None
+    images: list[str] = field(default_factory=list)
 
     def published_dt(self) -> Optional[datetime]:
         if not self.published_at:
@@ -221,6 +225,11 @@ class PlaceInfo:
     total_reviews: Optional[int] = None
     data_id: Optional[str] = None   # 0x...:0x... form returned by SerpApi
     place_id: Optional[str] = None  # ChI... form returned by SerpApi
+    price: Optional[str] = None
+    open_state: Optional[str] = None
+    service_options: list[str] = field(default_factory=list)
+    popular_times: dict[str, Any] = field(default_factory=dict)
+    menu_urls: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +824,251 @@ def reviews_lookup_params(data_id: str) -> dict[str, str]:
     return {"data_id": data_id}
 
 
+_SERVICE_KEY_LABELS: dict[str, str] = {
+    "dine_in": "內用 (Dine-in)",
+    "dine-in": "內用 (Dine-in)",
+    "takeout": "外帶 (Takeout)",
+    "takeaway": "外帶 (Takeout)",
+    "delivery": "外送 (Delivery)",
+    "no_contact_delivery": "無接觸外送 (No-contact delivery)",
+    "curbside_pickup": "路邊取餐 (Curbside pickup)",
+    "drive_through": "得來速 (Drive-through)",
+    "outdoor_seating": "戶外座位 (Outdoor seating)",
+    "in_store_pickup": "店內取貨 (In-store pickup)",
+    "in_store_shopping": "店內購物 (In-store shopping)",
+    "onsite_services": "現場服務 (Onsite services)",
+    "reservable": "可訂位 (Reservable)",
+    "wheelchair_accessible_entrance": "無障礙入口 (Wheelchair accessible)",
+}
+
+_DAY_ZH_MAP: dict[str, str] = {
+    "monday": "週一",
+    "tuesday": "週二",
+    "wednesday": "週三",
+    "thursday": "週四",
+    "friday": "週五",
+    "saturday": "週六",
+    "sunday": "週日",
+}
+
+_MENU_TAG_RE = re.compile(
+    r"(?:menu|菜單|菜单|價目|价目|價格表|价格表|メニュー|お品書き|메뉴|차림표|carte|speisekarte)",
+    re.IGNORECASE,
+)
+
+_MENU_REVIEW_TEXT_RE = re.compile(
+    r"(?:菜單|菜单|價目表|價目|價格表|價位|最新價格|漲價|調漲|\bmenu\b|price\s*list|メニュー|메뉴|가격표)",
+    re.IGNORECASE,
+)
+
+
+def _extract_service_options(core: dict) -> list[str]:
+    """Extract service options, accessibility, and key payment/planning tags from SerpApi place dict."""
+    if not isinstance(core, dict):
+        return []
+    options: list[str] = []
+    seen: set[str] = set()
+
+    def _add(item: str) -> None:
+        val = str(item or "").strip()
+        if not val:
+            return
+        norm = val.casefold()
+        if norm not in seen:
+            seen.add(norm)
+            options.append(val)
+
+    raw_so = core.get("service_options")
+    if isinstance(raw_so, dict):
+        for k, v in raw_so.items():
+            if v is True:
+                k_clean = str(k).strip().lower().replace(" ", "_")
+                label = _SERVICE_KEY_LABELS.get(k_clean, str(k).strip().replace("_", " "))
+                _add(label)
+            elif isinstance(v, str) and v.strip():
+                _add(v.strip())
+    elif isinstance(raw_so, list):
+        for item in raw_so:
+            if isinstance(item, str):
+                _add(item)
+
+    # Also check top-level boolean flags or extensions
+    raw_ext = core.get("extensions")
+    if isinstance(raw_ext, list):
+        priority_ext_keys = {
+            "service_options", "accessibility", "payments", "planning",
+            "dining_options", "offerings", "amenities",
+            "服務選項", "無障礙程度", "無障礙設施", "付款方式", "規劃", "用餐選擇",
+        }
+        for ext_block in raw_ext:
+            if not isinstance(ext_block, dict):
+                continue
+            for k, vals in ext_block.items():
+                k_norm = str(k).strip().lower()
+                if k_norm in priority_ext_keys and isinstance(vals, list):
+                    for v in vals:
+                        if isinstance(v, str):
+                            _add(v)
+
+    return options[:8]
+
+
+def _extract_popular_times(core: dict) -> dict[str, Any]:
+    """Extract zero-cost popular_times, live busyness, and typical time spent from SerpApi place dict."""
+    if not isinstance(core, dict):
+        return {}
+    pt = core.get("popular_times")
+    result: dict[str, Any] = {}
+
+    live_info: Optional[str] = None
+    time_spent: Optional[str] = None
+
+    if isinstance(pt, dict):
+        live_hash = pt.get("live_hash")
+        if isinstance(live_hash, dict):
+            if isinstance(live_hash.get("info"), str) and live_hash["info"].strip():
+                live_info = live_hash["info"].strip()
+            if isinstance(live_hash.get("time_spent"), str) and live_hash["time_spent"].strip():
+                time_spent = live_hash["time_spent"].strip()
+        if not live_info and isinstance(pt.get("live_info"), str) and pt["live_info"].strip():
+            live_info = pt["live_info"].strip()
+        if not time_spent and isinstance(pt.get("typical_time_spent"), str) and pt["typical_time_spent"].strip():
+            time_spent = pt["typical_time_spent"].strip()
+
+        graph = pt.get("graph_results")
+        if isinstance(graph, dict):
+            peaks: list[dict[str, Any]] = []
+            for day_key, slots in graph.items():
+                if not isinstance(slots, list) or not slots:
+                    continue
+                day_norm = str(day_key).strip().lower()
+                day_en = day_norm.capitalize()
+                day_zh = _DAY_ZH_MAP.get(day_norm, day_en)
+
+                high_slots: list[dict[str, Any]] = []
+                max_slot: Optional[dict[str, Any]] = None
+                for s in slots:
+                    if not isinstance(s, dict):
+                        continue
+                    score = s.get("busyness_score")
+                    try:
+                        score_int = int(score) if score is not None else 0
+                    except (ValueError, TypeError):
+                        score_int = 0
+                    if score_int <= 0:
+                        continue
+                    entry = {
+                        "time": str(s.get("time") or "").strip(),
+                        "score": score_int,
+                        "info": str(s.get("info") or "").strip(),
+                    }
+                    if max_slot is None or score_int > max_slot["score"]:
+                        max_slot = entry
+                    if score_int >= 75:
+                        high_slots.append(entry)
+
+                if high_slots:
+                    start_t = high_slots[0]["time"]
+                    end_t = high_slots[-1]["time"]
+                    window = f"{start_t}–{end_t}" if start_t != end_t else start_t
+                    best_s = max(high_slots, key=lambda x: x["score"])
+                    peaks.append({
+                        "day": day_en,
+                        "day_zh": day_zh,
+                        "window": window,
+                        "max_score": best_s["score"],
+                        "info": best_s["info"],
+                    })
+                elif max_slot and max_slot["score"] >= 65:
+                    peaks.append({
+                        "day": day_en,
+                        "day_zh": day_zh,
+                        "window": max_slot["time"],
+                        "max_score": max_slot["score"],
+                        "info": max_slot["info"],
+                    })
+
+            if peaks:
+                peaks.sort(key=lambda x: x["max_score"], reverse=True)
+                result["peak_hours"] = peaks[:3]
+
+    if not live_info and isinstance(core.get("live_busyness"), str) and core["live_busyness"].strip():
+        live_info = core["live_busyness"].strip()
+    if not time_spent and isinstance(core.get("typical_time_spent"), str) and core["typical_time_spent"].strip():
+        time_spent = core["typical_time_spent"].strip()
+
+    if live_info:
+        result["live_info"] = live_info
+    if time_spent:
+        result["typical_time_spent"] = time_spent
+
+    return result
+
+
+def _extract_menu_urls(core: dict) -> list[str]:
+    """Extract menu links or menu-tagged photo URLs from SerpApi place dict."""
+    if not isinstance(core, dict):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(u: Any) -> None:
+        if not isinstance(u, str):
+            return
+        val = u.strip()
+        if val.startswith(("http://", "https://")) and val not in seen:
+            seen.add(val)
+            urls.append(val)
+
+    menu_field = core.get("menu")
+    if isinstance(menu_field, str):
+        _add(menu_field)
+    elif isinstance(menu_field, dict):
+        _add(menu_field.get("link") or menu_field.get("url") or menu_field.get("image"))
+
+    for key in ("photos", "images", "categories"):
+        items = core.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = " ".join(
+                str(item.get(k) or "") for k in ("title", "category", "label", "tag", "name")
+            )
+            if _MENU_TAG_RE.search(label):
+                _add(item.get("image") or item.get("link") or item.get("url") or item.get("thumbnail"))
+
+    return urls[:2]
+
+
+def _extract_menu_urls_from_reviews(reviews: list[Review], existing: Optional[list[str]] = None) -> list[str]:
+    """Extract the newest 1-2 menu/price photo URLs from recent reviews mentioning menu or price keywords."""
+    urls: list[str] = list(existing or [])
+    seen: set[str] = set(urls)
+    if len(urls) >= 2:
+        return urls[:2]
+
+    # Sort reviews with images by published_dt descending so newest menu photos come first
+    with_images = [r for r in reviews if r.images]
+    if not with_images:
+        return urls
+
+    epoch_min = datetime.min.replace(tzinfo=timezone.utc)
+    with_images.sort(key=lambda r: r.published_dt() or epoch_min, reverse=True)
+
+    for r in with_images:
+        if _MENU_REVIEW_TEXT_RE.search(r.text):
+            for img_url in r.images:
+                if img_url not in seen:
+                    seen.add(img_url)
+                    urls.append(img_url)
+                    if len(urls) >= 2:
+                        return urls[:2]
+
+    return urls[:2]
+
+
 def _parse_place_dict(core: dict) -> PlaceInfo:
     """Parse a SerpApi place_results or local_results dictionary into PlaceInfo."""
     if not isinstance(core, dict):
@@ -862,6 +1116,17 @@ def _parse_place_dict(core: dict) -> PlaceInfo:
     except (ValueError, TypeError):
         total_reviews = None
 
+    # Zero-cost metadata: price, open_state, service_options, popular_times, menu_urls
+    raw_price = core.get("price") or core.get("price_level")
+    price = str(raw_price).strip() if raw_price is not None and str(raw_price).strip() else None
+
+    raw_open = core.get("open_state") or core.get("hours")
+    open_state = str(raw_open).strip() if isinstance(raw_open, str) and raw_open.strip() else None
+
+    service_options = _extract_service_options(core)
+    popular_times = _extract_popular_times(core)
+    menu_urls = _extract_menu_urls(core)
+
     return PlaceInfo(
         name=name,
         address=address,
@@ -873,6 +1138,11 @@ def _parse_place_dict(core: dict) -> PlaceInfo:
         total_reviews=total_reviews,
         data_id=core.get("data_id"),
         place_id=core.get("place_id"),
+        price=price,
+        open_state=open_state,
+        service_options=service_options,
+        popular_times=popular_times,
+        menu_urls=menu_urls,
     )
 
 
@@ -1088,6 +1358,98 @@ def search_serpapi_place(
     raise ValueError(f"No matching Google Maps place found for query: '{cleaned_query}'")
 
 
+def search_serpapi_top_places(
+    api_key: str,
+    query: str,
+    top_n: int = 3,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    zoom: int = 15,
+    lang: str = "zh-tw",
+) -> Tuple[str, list[Tuple[str, PlaceInfo, Optional[int]]], int]:
+    """Search Google Maps once, strip sponsored ads, and return top N highest-rated organic candidates."""
+    has_coords = lat is not None and lng is not None
+    cleaned_query = clean_search_query(query, has_coords=has_coords)
+    if not cleaned_query:
+        raise ValueError("Search query cannot be empty.")
+
+    limit = max(1, min(int(top_n), 5))
+    params: dict[str, Any] = {
+        "api_key": api_key,
+        "engine": "google_maps",
+        "type": "search",
+        "q": cleaned_query,
+        "hl": (lang or "zh-tw").lower(),
+        "output": "json",
+    }
+    if has_coords and lat is not None and lng is not None:
+        params["ll"] = format_serpapi_ll(lat, lng, zoom)
+        log(f"Area Discovery (Top-{limit}): q='{cleaned_query}' near ({lat:.5f}, {lng:.5f})")
+    else:
+        log(f"Area Discovery (Top-{limit}): q='{cleaned_query}'")
+
+    payload = http_get_json(SERPAPI_ENDPOINT, params)
+
+    if isinstance(payload.get("place_results"), dict):
+        p_info = _parse_place_dict(payload["place_results"])
+        data_id = p_info.data_id or p_info.place_id
+        if data_id:
+            dist_m = None
+            if has_coords and lat is not None and lng is not None and p_info.latitude is not None and p_info.longitude is not None:
+                dist_m = haversine_distance_m(lat, lng, p_info.latitude, p_info.longitude)
+            return cleaned_query, [(str(data_id), p_info, dist_m)], 0
+
+    raw_locals = payload.get("local_results")
+    if isinstance(raw_locals, list) and raw_locals:
+        valid_entries = [
+            e for e in raw_locals
+            if isinstance(e, dict) and (e.get("data_id") or e.get("place_id"))
+        ]
+        if valid_entries:
+            sponsored_count = sum(1 for e in valid_entries if e.get("sponsored"))
+            organic_entries = [e for e in valid_entries if not e.get("sponsored")]
+            pool = organic_entries or valid_entries
+
+            parsed_pool: list[Tuple[int, PlaceInfo, str, Optional[int]]] = []
+            seen_ids: set[str] = set()
+            for idx, entry in enumerate(pool):
+                p_info = _parse_place_dict(entry)
+                cid = str(p_info.data_id or p_info.place_id)
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                dist_m = None
+                if (
+                    has_coords
+                    and lat is not None
+                    and lng is not None
+                    and p_info.latitude is not None
+                    and p_info.longitude is not None
+                ):
+                    dist_m = haversine_distance_m(lat, lng, p_info.latitude, p_info.longitude)
+                parsed_pool.append((idx, p_info, cid, dist_m))
+
+            # Prefer candidates with at least a minimal review base (>= 5) if enough exist
+            credible_pool = [item for item in parsed_pool if (item[1].total_reviews or 0) >= 5]
+            ranking_pool = credible_pool if len(credible_pool) >= limit else parsed_pool
+
+            # Sort by highest average rating first, then review count, then original relevance index
+            ranking_pool.sort(
+                key=lambda item: (
+                    -(item[1].average_rating or 0.0),
+                    -(item[1].total_reviews or 0),
+                    item[0],
+                )
+            )
+            selected = [
+                (cid, p_info, dist_m)
+                for _, p_info, cid, dist_m in ranking_pool[:limit]
+            ]
+            return cleaned_query, selected, sponsored_count
+
+    raise ValueError(f"No matching Google Maps places found for query: '{cleaned_query}'")
+
+
 def parse_raw_reviews(payload: dict) -> list[Review]:
     """Extract and parse reviews from SerpApi reviews payload."""
     raw_list = payload.get("reviews") or payload.get("reviews_results") or []
@@ -1133,6 +1495,21 @@ def parse_raw_reviews(payload: dict) -> list[Review]:
         except (ValueError, TypeError):
             likes = 0
 
+        # Review attached photos / images
+        review_images: list[str] = []
+        raw_imgs = entry.get("images") or entry.get("photos") or []
+        if isinstance(raw_imgs, list):
+            for img in raw_imgs:
+                img_url = None
+                if isinstance(img, str):
+                    img_url = img.strip()
+                elif isinstance(img, dict):
+                    u = img.get("link") or img.get("image") or img.get("url") or img.get("thumbnail")
+                    if isinstance(u, str):
+                        img_url = u.strip()
+                if img_url and img_url.startswith(("http://", "https://")) and img_url not in review_images:
+                    review_images.append(img_url)
+
         reviews.append(
             Review(
                 author=str(author).strip(),
@@ -1143,6 +1520,7 @@ def parse_raw_reviews(payload: dict) -> list[Review]:
                 is_local_guide=is_local_guide,
                 like_count=likes,
                 review_id=review_id,
+                images=review_images,
             )
         )
     return reviews
@@ -1250,13 +1628,17 @@ def _smart_truncate(text: str, limit: int) -> str:
     return chunk.rstrip()
 
 
-def clip_reviews_for_prompt(reviews: list[Review]) -> list[Tuple[Review, str]]:
-    """Strictly clip reviews to prevent prompt token bloat."""
+def clip_reviews_for_prompt(
+    reviews: list[Review],
+    max_reviews: int = MAX_REVIEWS_FOR_LLM,
+    max_total_chars: int = MAX_TOTAL_REVIEW_CHARS,
+) -> list[Tuple[Review, str]]:
+    """Strictly clip reviews to prevent prompt token bloat (supports custom budgets for compare/top-N)."""
     clipped: list[Tuple[Review, str]] = []
     total_chars = 0
 
     for r in reviews:
-        if len(clipped) >= MAX_REVIEWS_FOR_LLM or total_chars >= MAX_TOTAL_REVIEW_CHARS:
+        if len(clipped) >= max_reviews or total_chars >= max_total_chars:
             break
 
         text = r.text.strip()
@@ -1268,7 +1650,7 @@ def clip_reviews_for_prompt(reviews: list[Review]) -> list[Tuple[Review, str]]:
             cut = True
 
         # Total review budget limit
-        remaining = MAX_TOTAL_REVIEW_CHARS - total_chars
+        remaining = max_total_chars - total_chars
         if len(text) > remaining:
             if remaining <= 10:
                 break
@@ -1302,13 +1684,111 @@ def format_reviews_block(clipped: list[Tuple[Review, str]]) -> str:
     return "\n".join(lines)
 
 
+def _is_cross_language(fetch_lang: Optional[str], preferred_lang: Optional[str]) -> bool:
+    """Return True when the primary fetched review language differs from the user's output language."""
+    if not fetch_lang or not preferred_lang:
+        return False
+    primary_fetch = str(fetch_lang).split("+")[0].strip().lower()
+    fetch_base = primary_fetch.split("-")[0]
+    pref_base = str(preferred_lang).strip().lower().split("-")[0]
+    return bool(fetch_base and pref_base and fetch_base != pref_base)
+
+
+_PROMO_MANIPULATION_RE = re.compile(
+    r"(?:五星好評|五顆星送|好評送|打卡送|評論送|給五星|五星送|集讚送|秀評論|出示評論|"
+    r"5[\s\-]*star\s+review|review\s+for\s+(?:a\s+)?free|free\s+\w+\s+for\s+(?:a\s+)?review|"
+    r"check[\s\-]*in\s+for\s+free|리뷰\s*이벤트|영수증\s*리뷰|口コミ投稿で|レビュー特典)",
+    re.IGNORECASE,
+)
+
+
+def _audit_review_manipulation(
+    reviews: list[dict[str, Any]],
+    rating_summary: Optional[dict[str, int]] = None,
+    average_rating: Optional[float] = None,
+) -> dict[str, Any]:
+    """Analyze curated reviews and rating distribution for fake-review / promo-incentive signals."""
+    promo_mentions = 0
+    for r in reviews:
+        txt = str(r.get("text") or "")
+        if _PROMO_MANIPULATION_RE.search(txt):
+            promo_mentions += 1
+
+    rs = rating_summary or {}
+    total_rs = sum(int(v) for v in rs.values() if isinstance(v, (int, float)))
+    one_star_ratio = 0.0
+    five_star_ratio = 0.0
+    if total_rs >= 10:
+        one_star_ratio = int(rs.get("1", 0)) / total_rs
+        five_star_ratio = int(rs.get("5", 0)) / total_rs
+
+    bimodal_warning = bool(total_rs >= 20 and one_star_ratio >= 0.10 and five_star_ratio >= 0.55)
+    if promo_mentions >= 2 or (promo_mentions >= 1 and bimodal_warning):
+        suspicion = "high"
+    elif promo_mentions == 1 or bimodal_warning:
+        suspicion = "moderate"
+    else:
+        suspicion = "low"
+
+    base_rating = float(average_rating or 0.0)
+    penalty = (0.45 * min(promo_mentions, 3)) + (0.35 if bimodal_warning else 0.0)
+    organic_score = round(max(0.0, base_rating - penalty), 2)
+
+    return {
+        "promo_mentions": promo_mentions,
+        "bimodal_warning": bimodal_warning,
+        "one_star_ratio": round(one_star_ratio, 3),
+        "suspicion_level": suspicion,
+        "organic_score": organic_score,
+    }
+
+
+def _format_popular_times_line(pt: dict[str, Any], is_zh: bool) -> Optional[str]:
+    """Format popular_times dict into a concise single-line digest summary."""
+    if not isinstance(pt, dict) or not pt:
+        return None
+    parts: list[str] = []
+    live_info = pt.get("live_info")
+    if live_info:
+        parts.append(f"{'即時狀態' if is_zh else 'Live'}: {live_info}")
+
+    peaks = pt.get("peak_hours")
+    if isinstance(peaks, list) and peaks:
+        peak_strs: list[str] = []
+        for pk in peaks[:2]:
+            if not isinstance(pk, dict):
+                continue
+            day_label = pk.get("day_zh") if is_zh else pk.get("day")
+            win = pk.get("window") or ""
+            score = pk.get("max_score")
+            score_tag = f" ({score}%)" if score else ""
+            if day_label and win:
+                peak_strs.append(f"{day_label} {win}{score_tag}")
+        if peak_strs:
+            parts.append(f"{'尖峰時段' if is_zh else 'Peak Hours'}: {', '.join(peak_strs)}")
+
+    time_spent = pt.get("typical_time_spent")
+    if time_spent:
+        parts.append(f"{'平均停留' if is_zh else 'Typical Stay'}: {time_spent}")
+
+    if not parts:
+        return None
+    prefix = "⏳ 排隊與尖峰預警" if is_zh else "⏳ Popular Times & Wait Time"
+    return f"{prefix}: {' | '.join(parts)}"
+
+
 def format_markdown_output(result: dict, include_agent_instructions: bool = False) -> str:
     """Format pipeline result into a structured Markdown digest for CLI, MCP, and LangChain."""
+    if result.get("mode") in ("compare", "top_discovery"):
+        return format_comparison_markdown_output(result, include_agent_instructions=include_agent_instructions)
+
     p = result.get("place") or {}
     s = result.get("stats") or {}
     search_meta = result.get("search") or {}
     target_lang = str(s.get("preferred_summary_language") or "en")
     is_zh = target_lang.lower().startswith("zh")
+    fetch_lang = str(s.get("fetch_language") or "en")
+    cross_lang = bool(s.get("cross_language")) or _is_cross_language(fetch_lang, target_lang)
 
     avg_rating = p.get("average_rating")
     if is_zh:
@@ -1353,10 +1833,37 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
 
     if p.get("address"):
         lines.append(f"📍 {'地址' if is_zh else 'Address'}: {p['address']}")
+
+    price_val = p.get("price")
+    open_state_val = p.get("open_state")
     if is_zh:
-        lines.append(f"🏷️ 分類: {p.get('type') or 'unknown'} | {rating_str} (總評數: {p.get('total_reviews') or 0})")
+        cat_line = f"🏷️ 分類: {p.get('type') or 'unknown'} | {rating_str} (總評數: {p.get('total_reviews') or 0})"
+        if price_val:
+            cat_line += f" | 💰 均消/價位: {price_val}"
+        if open_state_val:
+            cat_line += f" | 🕒 營業狀態: {open_state_val}"
+        lines.append(cat_line)
     else:
-        lines.append(f"🏷️ Category: {p.get('type') or 'unknown'} | {rating_str} (Total reviews: {p.get('total_reviews') or 0})")
+        cat_line = f"🏷️ Category: {p.get('type') or 'unknown'} | {rating_str} (Total reviews: {p.get('total_reviews') or 0})"
+        if price_val:
+            cat_line += f" | 💰 Price: {price_val}"
+        if open_state_val:
+            cat_line += f" | 🕒 Status: {open_state_val}"
+        lines.append(cat_line)
+
+    service_opts = p.get("service_options") or []
+    if service_opts:
+        so_label = "🛎️ 服務與設施" if is_zh else "🛎️ Service & Options"
+        lines.append(f"{so_label}: {' | '.join(str(x) for x in service_opts)}")
+
+    pt_line = _format_popular_times_line(p.get("popular_times") or {}, is_zh=is_zh)
+    if pt_line:
+        lines.append(pt_line)
+
+    menu_urls = p.get("menu_urls") or []
+    if menu_urls:
+        menu_label = "📋 最新菜單與價目圖片" if is_zh else "📋 Latest Menu & Price Photos"
+        lines.append(f"{menu_label}: {' | '.join(str(u) for u in menu_urls)}")
 
     rs = p.get("rating_summary") or {}
     if rs:
@@ -1367,15 +1874,17 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
 
     sort_label = s.get("sort_by") or "qualityScore"
     if is_zh:
+        cross_note = " | 🗣️ 跨語系點餐手指卡已啟用" if cross_lang else ""
         lines.append(
             f"📊 評論抽樣: 採集 {s.get('used_reviews') or 0} 則關鍵評論 "
-            f"(來源語系: {s.get('fetch_language') or 'en'} | 排序: {sort_label})\n"
+            f"(來源語系: {fetch_lang} | 排序: {sort_label}{cross_note})\n"
         )
         lines.append("## 精選評論清單 (Evidence Data)")
     else:
+        cross_note = " | 🗣️ Point-and-Speak Bilingual Mode Active" if cross_lang else ""
         lines.append(
             f"📊 Review Sample: {s.get('used_reviews') or 0} curated reviews "
-            f"(Source language: {s.get('fetch_language') or 'en'} | Sort: {sort_label})\n"
+            f"(Source language: {fetch_lang} | Sort: {sort_label}{cross_note})\n"
         )
         lines.append("## Curated Reviews (Evidence Data)")
     lines.append(result.get("formatted_reviews") or "")
@@ -1386,22 +1895,126 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
                 "",
                 "---",
                 f"## 🦊 TL;DReview 分析與排版規範 (請以 `{target_lang}` 輸出)",
-                "請嚴格根據上方精選評論證據（Evidence Data）產出結構化報告：",
-                "1. **嚴禁幻覺（Anti-Hallucination）**：所有優缺點、招牌菜色、消費規則必須 100% 來自上述評論，未提及的維度請直接整段省略。",
+                "請嚴格根據上方精選評論證據（Evidence Data）與結構化元數據產出報告：",
+                "1. **嚴禁幻覺（Anti-Hallucination）**：所有優缺點、招牌菜色、消費規則必須 100% 來自上述評論或官方元數據，未提及的維度請直接整段省略。",
                 "2. **評分操縱示警**：若評論提及「五星好評送飲料/小菜/折價」等刷評活動，或星級呈極端 M 型分布，請務必於「💡 營運洞察與消費規則」明確示警。",
                 "3. **兩極評價標註**：若同一項目評價分歧，請標註「（評價兩極）」並平實呈現雙方觀點。",
-                "4. **7 大標準維度**：🍜 必點招牌 / 核心亮點、👍 優勢與推薦點、👎 缺點與避雷提醒、💡 營運洞察與消費規則、🤫 內行人的秘密撇步、🚗 交通與停車指南、🚨 特別點名。",
+                "4. **排隊與尖峰預警**：若上方提供 `⏳ 排隊與尖峰預警`（即時擁擠度、尖峰時段、平均停留時間），請整合進「🤫 內行人的秘密撇步」提醒避開尖峰。",
+                "5. **營業狀態與最新價格防呆**：請於開頭 Digest Header 保留 `💰 均消/價位`、`🕒 營業狀態` 與 `🛎️ 服務與設施`；若附有 `📋 最新菜單與價目圖片` 連結，請列出或以最新評論/菜單價格為準，避免舊評論的過時價格幻覺。",
+                "6. **🗣️ 外國旅遊「點餐手指卡 / 生存小抄」**：當來源評論語系與輸出語言不同（如日本/韓國/泰國/法國等跨語言查詢）時，「🍜 必點招牌 / 核心亮點」中的每一道推薦品項**必須保留當地語言原始菜名對照**（例如：`炙燒和牛握壽司 (炙り和牛握り)` 或 `Braised Pork Belly (豚の角煮)`），方便旅客直接把手機螢幕指給店員看完成點餐。",
+                "7. **7 大標準維度**：🍜 必點招牌 / 核心亮點、👍 優勢與推薦點、👎 缺點與避雷提醒、💡 營運洞察與消費規則、🤫 內行人的秘密撇步、🚗 交通與停車指南、🚨 特別點名。",
             ])
         else:
             lines.extend([
                 "",
                 "---",
                 f"## 🦊 TL;DReview Analysis & Formatting Guidelines (Output in `{target_lang}`)",
-                "Synthesize a structured intelligence briefing strictly grounded in the Evidence Data above:",
-                "1. **Anti-Hallucination**: Every dish, pro, con, or rule MUST be 100% backed by the reviews above. Omit any section that has no direct evidence.",
+                "Synthesize a structured intelligence briefing strictly grounded in the Evidence Data and metadata above:",
+                "1. **Anti-Hallucination**: Every dish, pro, con, or rule MUST be 100% backed by the reviews or metadata above. Omit any section that has no direct evidence.",
                 "2. **Rating Manipulation Radar**: If reviews mention '5-star review/check-in for freebies/discounts' or show an extreme bimodal rating distribution, explicitly warn the user under '💡 Operational Insights & Rules'.",
                 "3. **Conflicting Feedback**: When opinions diverge sharply on an item, label it `(Mixed feedback)` and present both sides objectively.",
-                "4. **7 Standard Sections**: 🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts.",
+                "4. **Popular Times & Wait Time**: If `⏳ Popular Times & Wait Time` is present above, integrate live busyness, peak hours, and typical stay duration into '🤫 Insider Tips'.",
+                "5. **Open State, Price & Latest Menu Guardrails**: Include `💰 Price`, `🕒 Status`, and `🛎️ Service & Options` in the Digest Header. If `📋 Latest Menu & Price Photos` URLs are present, surface them and prioritize recent prices over outdated review prices.",
+                "6. **🗣️ Traveler's Point-and-Speak Card**: Whenever the review source language differs from the output language (`cross_language`), every recommended dish in '🍜 Must-Try / Core Highlights' **MUST include the original local-language dish name in parentheses** (e.g., `Braised Pork Belly (豚の角煮)`), so travelers can point at their phone screen to order.",
+                "7. **7 Standard Sections**: 🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts.",
+            ])
+
+    return "\n".join(lines)
+
+
+def format_comparison_markdown_output(result: dict, include_agent_instructions: bool = False) -> str:
+    """Format multi-venue (--compare or --top N) result into a unified Markdown comparison/audit context."""
+    mode = result.get("mode") or "compare"
+    places = result.get("places") or []
+    target_lang = str(result.get("preferred_summary_language") or "zh-TW")
+    is_zh = target_lang.lower().startswith("zh")
+
+    lines: list[str] = []
+    if mode == "top_discovery":
+        query_str = result.get("query") or ""
+        sponsored_removed = result.get("sponsored_removed") or 0
+        winner = result.get("recommended_winner") or {}
+        if is_zh:
+            lines.append(f"# 🗺️ 區域探索 Top-{len(places)} 掃描與防洗分稽核：「{query_str}」")
+            lines.append(
+                f"🛡️ 已自動剔除 {sponsored_removed} 筆贊助廣告 (Sponsored) | "
+                f"🏆 防洗分推薦首選: **{winner.get('name') or 'N/A'}** "
+                f"(真實有機評分: {winner.get('organic_score', 'N/A')} / 刷評嫌疑: {winner.get('suspicion_level', 'low')})"
+            )
+        else:
+            lines.append(f"# 🗺️ Area Discovery Top-{len(places)} Scan & Anti-Manipulation Audit: \"{query_str}\"")
+            lines.append(
+                f"🛡️ Stripped {sponsored_removed} Sponsored Ads | "
+                f"🏆 True Organic Winner: **{winner.get('name') or 'N/A'}** "
+                f"(Organic Score: {winner.get('organic_score', 'N/A')} / Manipulation Risk: {winner.get('suspicion_level', 'low')})"
+            )
+    else:
+        names = [str((item.get("place") or {}).get("name") or f"Store #{i + 1}") for i, item in enumerate(places)]
+        if is_zh:
+            lines.append(f"# ⚔️ 多店 PK 決策對比：{' vs. '.join(names)}")
+        else:
+            lines.append(f"# ⚔️ Multi-Venue Side-by-Side Comparison: {' vs. '.join(names)}")
+
+    lines.append("")
+
+    for idx, item in enumerate(places, 1):
+        p = item.get("place") or {}
+        s = item.get("stats") or {}
+        audit = item.get("audit") or {}
+        avg_r = p.get("average_rating")
+        rating_str = f"⭐ {avg_r:.1f}" if avg_r is not None else "⭐ N/A"
+        dist_m = (item.get("search") or {}).get("matched_distance_m")
+        dist_str = f" | 📍 ~{dist_m}m" if dist_m is not None else ""
+        price_str = f" | 💰 {p['price']}" if p.get("price") else ""
+        open_str = f" | 🕒 {p['open_state']}" if p.get("open_state") else ""
+
+        lines.append(f"## [{idx}] {p.get('name') or f'Venue {idx}'} ({rating_str}, {p.get('total_reviews') or 0} reviews{dist_str}{price_str}{open_str})")
+        if p.get("address"):
+            lines.append(f"- **{'地址' if is_zh else 'Address'}**: {p['address']}")
+        if p.get("service_options"):
+            lines.append(f"- **{'服務與設施' if is_zh else 'Services'}**: {' | '.join(p['service_options'])}")
+        pt_line = _format_popular_times_line(p.get("popular_times") or {}, is_zh=is_zh)
+        if pt_line:
+            lines.append(f"- {pt_line}")
+        if p.get("menu_urls"):
+            lines.append(f"- **{'最新菜單圖片' if is_zh else 'Latest Menu Photos'}**: {' | '.join(p['menu_urls'])}")
+        if audit:
+            if is_zh:
+                lines.append(
+                    f"- **🛡️ 防洗分檢測**: 刷評關鍵字提及 {audit.get('promo_mentions', 0)} 次 | "
+                    f"極端兩極分布: {'是' if audit.get('bimodal_warning') else '否'} | "
+                    f"嫌疑等級: `{audit.get('suspicion_level', 'low')}` | "
+                    f"有機加權分: **{audit.get('organic_score', 'N/A')}**"
+                )
+            else:
+                lines.append(
+                    f"- **🛡️ Manipulation Audit**: Promo mentions: {audit.get('promo_mentions', 0)} | "
+                    f"Bimodal warning: {audit.get('bimodal_warning', False)} | "
+                    f"Risk: `{audit.get('suspicion_level', 'low')}` | "
+                    f"Organic Score: **{audit.get('organic_score', 'N/A')}**"
+                )
+        lines.append(f"- **{'精選評論抽樣' if is_zh else 'Curated Reviews'}** ({s.get('used_reviews') or 0} reviews, lang={s.get('fetch_language') or 'en'}):")
+        lines.append(item.get("formatted_reviews") or "(No reviews)")
+        lines.append("")
+
+    if include_agent_instructions:
+        if is_zh:
+            lines.extend([
+                "---",
+                f"## 🦊 TL;DReview 多店決策與橫向比較規範 (請以 `{target_lang}` 輸出)",
+                "請根據上方各店家的精選評論與防洗分稽核數據，輸出結構化 PK 決策報告：",
+                "1. **📊 橫向 PK 對比表（Markdown Table）**：請建立對比表格，比較各店的：**評分與真實度（有無刷評）**、**🍜 必點招牌**、**👎 雷點與抱怨**、**⏳ 排隊難度与尖峰時段**、**💰 價格與營業狀態**、**🎯 適合誰**。",
+                "2. **🛡️ 防洗分稽核與真實冠軍推薦**：揭露哪幾家有「五星好評送小菜/飲料」等洗分跡象，並明確推薦「🏆 真正零刷評 / 最值得去的冠軍店家」。",
+                "3. **🗣️ 點餐手指卡**：若為跨語言查詢（如日/韓/泰/法文評論），必點菜色請保留當地語言原名對照（如 `炙燒和牛 (炙り和牛)`）。",
+            ])
+        else:
+            lines.extend([
+                "---",
+                f"## 🦊 TL;DReview Multi-Venue Comparison & Audit Guidelines (Output in `{target_lang}`)",
+                "Synthesize a side-by-side decision report strictly grounded in the venue evidence and manipulation audit above:",
+                "1. **📊 Side-by-Side Comparison Table**: Build a Markdown table comparing each venue across: **Rating & Organic Trust**, **🍜 Must-Try Dishes**, **👎 Red Flags & Cons**, **⏳ Wait Time & Peak Hours**, **💰 Price & Open Status**, and **🎯 Best For**.",
+                "2. **🛡️ Anti-Manipulation Audit & Winner Call**: Call out any venue using review-for-freebie promotions and crown the **🏆 True Organic Winner**.",
+                "3. **🗣️ Traveler's Point-and-Speak**: If cross-language reviews were fetched, preserve original local-language dish names in parentheses next to translated names.",
             ])
 
     return "\n".join(lines)
@@ -1446,6 +2059,10 @@ def _cache_save(path: str, result: dict) -> None:
 
 def _merge_place_info(primary: PlaceInfo, secondary: PlaceInfo) -> PlaceInfo:
     """Merge two PlaceInfo instances, preferring non-empty fields from primary."""
+    merged_menus: list[str] = []
+    for u in (primary.menu_urls or []) + (secondary.menu_urls or []):
+        if u not in merged_menus:
+            merged_menus.append(u)
     return PlaceInfo(
         name=primary.name or secondary.name,
         address=primary.address or secondary.address,
@@ -1457,6 +2074,11 @@ def _merge_place_info(primary: PlaceInfo, secondary: PlaceInfo) -> PlaceInfo:
         total_reviews=primary.total_reviews if primary.total_reviews is not None else secondary.total_reviews,
         data_id=primary.data_id or secondary.data_id,
         place_id=primary.place_id or secondary.place_id,
+        price=primary.price or secondary.price,
+        open_state=primary.open_state or secondary.open_state,
+        service_options=primary.service_options or secondary.service_options,
+        popular_times=primary.popular_times or secondary.popular_times,
+        menu_urls=merged_menus[:2],
     )
 
 
@@ -1472,6 +2094,9 @@ def run_pipeline(
     ll: Optional[str] = None,
     zoom: int = 15,
     image_path: Optional[str] = None,
+    max_reviews: int = MAX_REVIEWS_FOR_LLM,
+    max_total_chars: int = MAX_TOTAL_REVIEW_CHARS,
+    pre_resolved_place: Optional[Tuple[str, PlaceInfo, Optional[int]]] = None,
 ) -> dict:
     """Full execution pipeline supporting Google Maps URLs, keyword/nearby search, and photos."""
     canonical_sort = normalize_sort_by(sort_by)
@@ -1499,67 +2124,79 @@ def run_pipeline(
             log(f"Recognized store query from image: '{raw_input}'")
 
     text_input = (raw_input or "").strip()
-    if not text_input:
+    if not text_input and not pre_resolved_place:
         raise ValueError("No Google Maps URL, store name, or search query provided.")
 
-    # 1. Check for Google Maps URL vs Keyword / Nearby Search
-    url = extract_google_maps_url(text_input)
+    # 1. Check for pre-resolved candidate, Google Maps URL, or Keyword / Nearby Search
     resolved_url: Optional[str] = None
     data_id: Optional[str] = None
     searched_place_info: Optional[PlaceInfo] = None
     search_meta: Optional[dict[str, Any]] = None
     fallback_query: Optional[str] = None
 
-    if url:
-        resolved_url = resolve_short_url(url)
-        data_id = extract_maps_data_id(resolved_url)
-        if not data_id:
-            url_coords = extract_coordinates(resolved_url)
-            if url_coords and (lat is None or lng is None):
-                lat, lng = url_coords
-            outside_text = text_input.replace(url, " ").strip()
-            fallback_query = outside_text or extract_search_query_from_maps_url(resolved_url)
-            if not fallback_query:
-                if url_coords:
-                    raise ValueError(
-                        f"URL contains coordinates ({url_coords}) but no place data_id. "
-                        "Please provide a store name or use a full place share link."
-                    )
-                raise ValueError(f"Unable to extract data_id or coordinates from URL: {resolved_url}")
-
-    if not data_id:
-        query_str = fallback_query if url else text_input
-        if lat is None or lng is None:
-            query_str, inline_coords = extract_inline_coordinates(query_str)
-            if inline_coords:
-                lat, lng = inline_coords
-        if not query_str:
-            raise ValueError(f"No valid Google Maps URL or place search query found in input: {raw_input}")
-
-        cleaned_q = clean_search_query(query_str, has_coords=(lat is not None and lng is not None))
-        data_id, searched_place_info, candidates = search_serpapi_place(
-            api_key=api_key,
-            query=query_str,
-            lat=lat,
-            lng=lng,
-            zoom=zoom,
-            lang=preferred_lang,
-        )
-        matched_dist = candidates[0].get("distance_m") if candidates else None
+    if pre_resolved_place is not None:
+        data_id, searched_place_info, matched_dist = pre_resolved_place
         search_meta = {
-            "query": text_input,
-            "cleaned_query": cleaned_q,
+            "query": text_input or (searched_place_info.name or ""),
+            "cleaned_query": text_input or (searched_place_info.name or ""),
             "latitude": lat,
             "longitude": lng,
-            "image_path": image_path,
             "matched_distance_m": matched_dist,
-            "candidates": candidates,
+            "candidates": [],
         }
+    else:
+        url = extract_google_maps_url(text_input)
+        if url:
+            resolved_url = resolve_short_url(url)
+            data_id = extract_maps_data_id(resolved_url)
+            if not data_id:
+                url_coords = extract_coordinates(resolved_url)
+                if url_coords and (lat is None or lng is None):
+                    lat, lng = url_coords
+                outside_text = text_input.replace(url, " ").strip()
+                fallback_query = outside_text or extract_search_query_from_maps_url(resolved_url)
+                if not fallback_query:
+                    if url_coords:
+                        raise ValueError(
+                            f"URL contains coordinates ({url_coords}) but no place data_id. "
+                            "Please provide a store name or use a full place share link."
+                        )
+                    raise ValueError(f"Unable to extract data_id or coordinates from URL: {resolved_url}")
+
+        if not data_id:
+            query_str = fallback_query if url else text_input
+            if lat is None or lng is None:
+                query_str, inline_coords = extract_inline_coordinates(query_str)
+                if inline_coords:
+                    lat, lng = inline_coords
+            if not query_str:
+                raise ValueError(f"No valid Google Maps URL or place search query found in input: {raw_input}")
+
+            cleaned_q = clean_search_query(query_str, has_coords=(lat is not None and lng is not None))
+            data_id, searched_place_info, candidates = search_serpapi_place(
+                api_key=api_key,
+                query=query_str,
+                lat=lat,
+                lng=lng,
+                zoom=zoom,
+                lang=preferred_lang,
+            )
+            matched_dist = candidates[0].get("distance_m") if candidates else None
+            search_meta = {
+                "query": text_input,
+                "cleaned_query": cleaned_q,
+                "latitude": lat,
+                "longitude": lng,
+                "image_path": image_path,
+                "matched_distance_m": matched_dist,
+                "candidates": candidates,
+            }
 
     log(f"Target data_id: {data_id}")
 
+    is_default_budget = (max_reviews == MAX_REVIEWS_FOR_LLM and max_total_chars == MAX_TOTAL_REVIEW_CHARS)
     cache_file = _cache_path(data_id, sort_by=canonical_sort)
-    if use_cache:
+    if use_cache and is_default_budget:
         cached = _cache_load(cache_file) or _cache_load(
             _cache_path(data_id, preferred_lang, sort_by=canonical_sort)
         )
@@ -1568,6 +2205,9 @@ def run_pipeline(
             cached["cached"] = True
             if isinstance(cached.get("stats"), dict):
                 cached["stats"]["preferred_summary_language"] = preferred_lang
+                cached["stats"]["cross_language"] = _is_cross_language(
+                    cached["stats"].get("fetch_language"), preferred_lang
+                )
             if search_meta:
                 cached["search"] = search_meta
             return cached
@@ -1608,19 +2248,8 @@ def run_pipeline(
 
     # Merge place info if first call was sparse or skipped
     if isinstance(raw_payload.get("place_info"), dict):
-        p_info = raw_payload["place_info"]
-        if not place_info.name:
-            place_info.name = p_info.get("title") or place_info.name
-        if not place_info.address:
-            place_info.address = p_info.get("address") or place_info.address
-        if not place_info.types and p_info.get("type"):
-            p_type = p_info.get("type")
-            place_info.types = [p_type] if isinstance(p_type, str) else list(p_type)
-        if place_info.average_rating is None and p_info.get("rating") is not None:
-            try:
-                place_info.average_rating = float(p_info["rating"])
-            except (ValueError, TypeError):
-                pass
+        p_from_rev = _parse_place_dict(raw_payload["place_info"])
+        place_info = _merge_place_info(place_info, p_from_rev)
 
     # Fetch second page if total reviews are large (>500), token exists, and not in save_quota mode
     if not save_quota and next_token and (total_count or 0) > NEXT_PAGE_THRESHOLD:
@@ -1673,6 +2302,9 @@ def run_pipeline(
         except Exception as exc:
             log(f"English refetch warning: {exc}")
 
+    # Extract newest 1-2 menu/price photo URLs from place info and reviews
+    place_info.menu_urls = _extract_menu_urls_from_reviews(reviews, existing=place_info.menu_urls)
+
     if not reviews:
         no_rev_res: dict[str, Any] = {
             "status": "no_reviews",
@@ -1686,7 +2318,23 @@ def run_pipeline(
 
     # 6. Curate and clip
     curated = curate_reviews(reviews)
-    clipped = clip_reviews_for_prompt(curated)
+    clipped = clip_reviews_for_prompt(
+        curated, max_reviews=max_reviews, max_total_chars=max_total_chars
+    )
+    cross_lang = _is_cross_language(fetch_lang, preferred_lang)
+
+    reviews_dicts = [
+        {
+            "author": r.author,
+            "rating": r.rating,
+            "relative_time": r.relative_time,
+            "is_local_guide": r.is_local_guide,
+            "like_count": r.like_count,
+            "text": text,
+            **({"images": r.images} if r.images else {}),
+        }
+        for r, text in clipped
+    ]
 
     result: dict[str, Any] = {
         "status": "success",
@@ -1700,6 +2348,11 @@ def run_pipeline(
             "average_rating": place_info.average_rating,
             "total_reviews": total_count or place_info.total_reviews or len(reviews),
             "rating_summary": place_info.rating_summary,
+            "price": place_info.price,
+            "open_state": place_info.open_state,
+            "service_options": place_info.service_options,
+            "popular_times": place_info.popular_times,
+            "menu_urls": place_info.menu_urls,
         },
         "stats": {
             "fetched_reviews": len(reviews),
@@ -1707,26 +2360,179 @@ def run_pipeline(
             "used_reviews": len(clipped),
             "fetch_language": fetch_lang,
             "preferred_summary_language": preferred_lang,
+            "cross_language": cross_lang,
             "sort_by": canonical_sort,
             "save_quota": save_quota,
         },
         "formatted_reviews": format_reviews_block(clipped),
-        "reviews": [
-            {
-                "author": r.author,
-                "rating": r.rating,
-                "relative_time": r.relative_time,
-                "is_local_guide": r.is_local_guide,
-                "like_count": r.like_count,
-                "text": text,
-            }
-            for r, text in clipped
-        ],
+        "reviews": reviews_dicts,
     }
     if search_meta:
         result["search"] = search_meta
-    _cache_save(cache_file, result)
+    if is_default_budget:
+        _cache_save(cache_file, result)
     return result
+
+
+def run_compare_pipeline(
+    targets: list[str],
+    api_key: str,
+    preferred_lang: str = "zh-TW",
+    use_cache: bool = True,
+    sort_by: str = "qualityScore",
+    save_quota: bool = False,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    ll: Optional[str] = None,
+    zoom: int = 15,
+    max_reviews_per_place: int = COMPARE_MAX_REVIEWS_PER_PLACE,
+    max_chars_per_place: int = COMPARE_MAX_CHARS_PER_PLACE,
+) -> dict:
+    """Fetch, curate, and audit multiple venues in parallel with scaled token budgets for side-by-side comparison."""
+    clean_targets = [t.strip() for t in targets if t and t.strip()]
+    if len(clean_targets) < 2:
+        raise ValueError("Compare mode (--compare) requires at least 2 URLs or store queries.")
+
+    def _fetch_one(target_str: str) -> dict:
+        res = run_pipeline(
+            raw_input=target_str,
+            api_key=api_key,
+            preferred_lang=preferred_lang,
+            use_cache=use_cache,
+            sort_by=sort_by,
+            save_quota=save_quota,
+            lat=lat,
+            lng=lng,
+            ll=ll,
+            zoom=zoom,
+            max_reviews=max_reviews_per_place,
+            max_total_chars=max_chars_per_place,
+        )
+        p = res.get("place") or {}
+        res["audit"] = _audit_review_manipulation(
+            res.get("reviews") or [],
+            rating_summary=p.get("rating_summary"),
+            average_rating=p.get("average_rating"),
+        )
+        return res
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(clean_targets), 5)) as pool:
+        place_results = list(pool.map(_fetch_one, clean_targets))
+
+    return {
+        "status": "success",
+        "mode": "compare",
+        "preferred_summary_language": preferred_lang,
+        "count": len(place_results),
+        "token_budget_per_place": {
+            "max_reviews": max_reviews_per_place,
+            "max_total_chars": max_chars_per_place,
+        },
+        "places": place_results,
+    }
+
+
+def run_top_discovery_pipeline(
+    query: str,
+    api_key: str,
+    top_n: int = 3,
+    preferred_lang: str = "zh-TW",
+    use_cache: bool = True,
+    sort_by: str = "qualityScore",
+    save_quota: bool = False,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    ll: Optional[str] = None,
+    zoom: int = 15,
+    max_reviews_per_place: int = COMPARE_MAX_REVIEWS_PER_PLACE,
+    max_chars_per_place: int = COMPARE_MAX_CHARS_PER_PLACE,
+) -> dict:
+    """Search nearby top N organic places, fetch reviews in parallel, and crown the true organic winner."""
+    if ll and (lat is None or lng is None):
+        parsed_ll = parse_ll_string(ll)
+        if not parsed_ll:
+            raise ValueError(f"Invalid coordinate string for ll: '{ll}'")
+        lat, lng = parsed_ll[0], parsed_ll[1]
+        if parsed_ll[2] is not None:
+            zoom = parsed_ll[2]
+
+    query_str = (query or "").strip()
+    if lat is None or lng is None:
+        query_str, inline_coords = extract_inline_coordinates(query_str)
+        if inline_coords:
+            lat, lng = inline_coords
+
+    cleaned_query, selected_candidates, sponsored_removed = search_serpapi_top_places(
+        api_key=api_key,
+        query=query_str,
+        top_n=top_n,
+        lat=lat,
+        lng=lng,
+        zoom=zoom,
+        lang=preferred_lang,
+    )
+
+    def _fetch_cand(cand: Tuple[str, PlaceInfo, Optional[int]]) -> dict:
+        cid, p_info, dist_m = cand
+        res = run_pipeline(
+            raw_input=p_info.name or cleaned_query,
+            api_key=api_key,
+            preferred_lang=preferred_lang,
+            use_cache=use_cache,
+            sort_by=sort_by,
+            save_quota=save_quota,
+            lat=lat,
+            lng=lng,
+            zoom=zoom,
+            max_reviews=max_reviews_per_place,
+            max_total_chars=max_chars_per_place,
+            pre_resolved_place=(cid, p_info, dist_m),
+        )
+        p = res.get("place") or {}
+        res["audit"] = _audit_review_manipulation(
+            res.get("reviews") or [],
+            rating_summary=p.get("rating_summary"),
+            average_rating=p.get("average_rating"),
+        )
+        return res
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(selected_candidates), 5)) as pool:
+        place_results = list(pool.map(_fetch_cand, selected_candidates))
+
+    # Crown the True Organic Winner (highest organic_score, tie-broken by lowest promo_mentions & highest review count)
+    recommended_winner: dict[str, Any] = {}
+    if place_results:
+        best = max(
+            place_results,
+            key=lambda item: (
+                (item.get("audit") or {}).get("organic_score", 0.0),
+                -((item.get("audit") or {}).get("promo_mentions", 0)),
+                ((item.get("place") or {}).get("total_reviews") or 0),
+            ),
+        )
+        bp = best.get("place") or {}
+        ba = best.get("audit") or {}
+        recommended_winner = {
+            "name": bp.get("name"),
+            "data_id": best.get("data_id"),
+            "average_rating": bp.get("average_rating"),
+            "organic_score": ba.get("organic_score"),
+            "suspicion_level": ba.get("suspicion_level"),
+            "promo_mentions": ba.get("promo_mentions"),
+        }
+
+    return {
+        "status": "success",
+        "mode": "top_discovery",
+        "query": cleaned_query,
+        "latitude": lat,
+        "longitude": lng,
+        "sponsored_removed": sponsored_removed,
+        "preferred_summary_language": preferred_lang,
+        "count": len(place_results),
+        "recommended_winner": recommended_winner,
+        "places": place_results,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1736,14 +2542,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Extract and curate Google Maps reviews from a URL, store/keyword query "
-            "(with optional coordinates), or signboard/menu photo."
+            "(with optional coordinates), signboard/menu photo, multi-venue --compare, or --top N discovery."
         )
     )
     parser.add_argument(
-        "url",
-        nargs="?",
-        default="",
-        help="Google Maps link, store name, address, or search query (e.g. '附近的全家便利商店')",
+        "urls",
+        nargs="*",
+        help="One or more Google Maps links, store names, addresses, or search queries",
     )
     parser.add_argument("--query", "-q", help="Explicit search query (store name, keyword, or address)")
     parser.add_argument("--lat", type=float, help="User current latitude for nearby search (e.g. 25.0330)")
@@ -1751,6 +2556,17 @@ def main() -> int:
     parser.add_argument("--ll", help="Coordinates in '@lat,lng,15z' or 'lat,lng' format")
     parser.add_argument("--zoom", type=int, default=15, help="Map zoom level when searching with coordinates (default: 15)")
     parser.add_argument("--image", help="Path to a photo of a store signboard, menu, or business card")
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Side-by-side comparison mode for 2+ venues with scaled token budgets",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=0,
+        help="Area Discovery mode: scan top N organic places nearby, audit manipulation, and crown the true winner",
+    )
     parser.add_argument("--api-key", help="SerpApi API Key (or set SERPAPI_API_KEY in environment / .env)")
     parser.add_argument("--lang", default="zh-TW", help="Preferred summary language code (default: zh-TW)")
     parser.add_argument(
@@ -1768,7 +2584,12 @@ def main() -> int:
     parser.add_argument("--parse-only", action="store_true", help="Only parse URL, query, or EXIF GPS without calling SerpApi")
 
     args = parser.parse_args()
-    raw_target = (args.query if args.query is not None else args.url) or ""
+    targets: list[str] = []
+    if args.query:
+        targets.append(args.query)
+    if args.urls:
+        targets.extend(u for u in args.urls if u and u.strip())
+    raw_target = targets[0] if targets else ""
 
     # Parse only mode
     if args.parse_only:
@@ -1819,19 +2640,47 @@ def main() -> int:
         return 1
 
     try:
-        result = run_pipeline(
-            raw_target,
-            api_key,
-            preferred_lang=args.lang,
-            use_cache=not args.no_cache,
-            sort_by=args.sort_by,
-            save_quota=args.save_quota,
-            lat=args.lat,
-            lng=args.lng,
-            ll=args.ll,
-            zoom=args.zoom,
-            image_path=args.image,
-        )
+        if args.compare or len(targets) >= 2:
+            result = run_compare_pipeline(
+                targets=targets,
+                api_key=api_key,
+                preferred_lang=args.lang,
+                use_cache=not args.no_cache,
+                sort_by=args.sort_by,
+                save_quota=args.save_quota,
+                lat=args.lat,
+                lng=args.lng,
+                ll=args.ll,
+                zoom=args.zoom,
+            )
+        elif args.top and args.top > 0:
+            result = run_top_discovery_pipeline(
+                query=raw_target,
+                api_key=api_key,
+                top_n=args.top,
+                preferred_lang=args.lang,
+                use_cache=not args.no_cache,
+                sort_by=args.sort_by,
+                save_quota=args.save_quota,
+                lat=args.lat,
+                lng=args.lng,
+                ll=args.ll,
+                zoom=args.zoom,
+            )
+        else:
+            result = run_pipeline(
+                raw_target,
+                api_key,
+                preferred_lang=args.lang,
+                use_cache=not args.no_cache,
+                sort_by=args.sort_by,
+                save_quota=args.save_quota,
+                lat=args.lat,
+                lng=args.lng,
+                ll=args.ll,
+                zoom=args.zoom,
+                image_path=args.image,
+            )
     except Exception as exc:
         safe_err = _redact_api_key(str(exc), api_key)
         print(json.dumps({"status": "error", "message": safe_err}), file=sys.stdout)

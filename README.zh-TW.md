@@ -10,7 +10,7 @@
 🌐 **[專案官網 (Official Website)](https://tldreview.app/)**
 
 [![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
-[![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)](#-版本更新紀錄-whats-new)
+[![Version](https://img.shields.io/badge/version-2.0.0-orange.svg)](#-版本更新紀錄-whats-new)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
@@ -23,19 +23,33 @@
 
 ## 🆕 版本更新紀錄 (What's New)
 
+### 🚀 v2.0.0
+- 💎 **Google Maps 結構化元數據最大化利用（Zero-Cost Metadata Extraction）**：不額外消耗 SerpApi Credit，直接從回應中提取關鍵情報：
+  - ⏳ **排隊與尖峰時段預警（Popular Times & Wait Time）**：解析 `popular_times`（即時擁擠狀態 Live Busyness、每週尖峰時段與平均停留時間），自動整合至「🤫 內行人的秘密撇步」提醒避開排隊高峰。
+  - 💰 **官方客單價區間、營業狀態與服務防呆**：提取 `price`（`$`–`$$$$` 或均消區間）、`open_state`（營業中、即將打烊、暫停營業）與 `service_options`（內用/外帶/無障礙設施/只收現金），直接呈現於 **Digest Header**，防止白跑一趟。
+  - 📋 **最新菜單照片與價格自動提取（Menu Photo & Price Extractor）**：從店家分類相簿或近期提及菜單/價目表的評論附圖中，自動篩選最新 1～2 張圖片連結（`menu_urls`），解決舊評論漲價前的價格幻覺。
+- ⚔️ **多店決策與批次工作流（Multi-Venue & Batch Workflows）**：
+  - **多店 PK 決策模式（`--compare`）**：支援同時傳入多間店家（如 `tldreview "店家A" "店家B" --compare`），自動依比例縮減單店 Token 預算（各取最關鍵 15 則評論 / 4,000 字上限）並平行抓取，輸出「**必點、雷點、排隊難度、價格、適合誰**」橫向對比表。
+  - **區域探索 Top-N 防洗分掃描（`--top 3`）**：透過 1 次 LBS 搜尋抓出附近評分最高的前 $N$ 家候選店，自動剔除贊助廣告（`Sponsored`）後平行抓取關鍵評論並做防洗分稽核，直接推薦「**🏆 真正零刷評**」的冠軍店家。
+- 🗣️ **外出旅遊與在地化增強（Travel & Localization Enhancements）**：
+  - **外國旅遊「點餐手指卡 / 生存小抄」**：當觸發跨語言查詢（如日文 `ja`、韓文 `ko`、泰文 `th`、法文 `fr` 評論翻譯為中文或英文摘要）時，強制要求「🍜 必點招牌 / 核心亮點」保留**當地語言原始菜名對照**（例如：`炙燒和牛握壽司 (炙り和牛握り)` 或 `Braised Pork Belly (豚の角煮)`），出國可直接把手機螢幕指給店員看完成點餐。
+  - **中文數字與台灣連鎖店名正規化**：修正 `_query_matches_title` 比對邏輯，自動將中文數字轉為阿拉伯數字（如 `五十嵐` ➔ `50嵐`、`八十五度C` ➔ `85°C`），確保座標搜尋精準選中最近分店。
+
 ### 🎉 v1.1.0
-- 📍 **新增「附近店家」與口語關鍵字搜尋**：除了貼上 Google Maps 網址外，現在支援直接說出「*附近的全家便利商店*」或店名關鍵字。AI Agent 可自動取得使用者目前座標（`--lat`、`--lng`），過濾贊助廣告並計算直線距離，自動鎖定最符合的最近分店並切入評論分析。
-- 📸 **新增「店家招牌／菜單照片」查詢**：支援傳送帶有店名或地址的照片（如店門招牌、菜單、名片或門牌）。結合 AI 視覺辨識與內建零依賴 EXIF GPS 座標提取（`--image`），自動識別店名與地址直入該店評論。
-- 🧩 **全平台 Agent 與工具鏈同步升級**：全面更新 Core CLI、MCP Server、LangChain `@tool`、xAI Grok Bot、Meta Muse 與 Master System Prompt，完整支援三種查詢模式。
+- 📍 **新增「附近店家」與口語關鍵字搜尋**：支援直接說出「*附近的全家便利商店*」搭配座標（`--lat`、`--lng`）鎖定最近分店切入評論分析。
+- 📸 **新增「店家招牌／菜單照片」查詢**：支援傳送帶有店名或地址的照片（招牌、菜單、名片或門牌），結合 AI Vision 與內建零依賴 EXIF GPS 提取（`--image`）直入評論。
+- 🧩 **全平台 Agent 與工具鏈同步升級**：同步更新 Core CLI、MCP Server、LangChain `@tool`、xAI Grok Bot 與 Meta Muse。
 
 ---
 
 ## 🦊 TL;DReview 是什麼？
 
-**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。支援 **三種直覺查詢方式**：
+**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。支援 **五種直覺查詢與決策模式**：
 1. 🔗 **貼上 Google Maps 網址**（含短網址與社群跳轉連結）
 2. 📍 **直接說「附近的店家」**（例如：「*附近的全家便利商店*」——由 AI Agent 取得你目前的座標，自動搜尋並切入最符合結果的店家評論）
 3. 📸 **傳送店家招牌或菜單照片**（拍下店門招牌、菜單、名片或門牌地址，自動辨識店名／地址並直入該店評論）
+4. ⚔️ **多店 PK 橫向比較（`--compare`）**（在 2～3 間猶豫不決的餐廳間直接產出橫向對比表）
+5. 🗺️ **區域探索 Top-N 防洗分掃描（`--top 3`）**（自動剔除廣告、平行掃描附近前 3 名並推薦真正零刷評冠軍）
 
 無論哪種方式，它都會從數百則又長又雜的評論中，整理出一份結構化報告：**必點招牌、優點、缺點與避雷、內行人祕笈、營運規則、交通停車**，讓你在出發前就掌握一個地點的完整細節。
 
@@ -210,6 +224,12 @@ python3 core/tldreview_tool.py "老張牛肉麵 台北市大安區" --markdown
 
 # 2D. 直接傳入店家招牌／菜單照片（自動提取照片 EXIF GPS 座標，若設 GEMINI_API_KEY 可自動 OCR 店名）
 python3 core/tldreview_tool.py --image ./signboard.jpg --markdown
+
+# 2E. 多店 PK 決策模式（--compare，自動縮減單店 Token 預算並平行抓取輸出橫向比較）
+python3 core/tldreview_tool.py "林東芳牛肉麵" "永康牛肉麵" --compare --markdown
+
+# 2F. 區域探索 Top-N 防洗分掃描（--top 3，剔除 Sponsored 廣告並推薦真正零刷評冠軍店家）
+python3 core/tldreview_tool.py "附近好吃的拉麵" --lat 25.0330 --lng 121.5654 --top 3 --markdown
 
 # 進階選項：指定排序（newest / lowest / highest）或開啟省額度模式（--save-quota）
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --sort-by newest --save-quota --markdown

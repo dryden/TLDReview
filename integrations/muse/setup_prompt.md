@@ -33,8 +33,12 @@ If Sentinel prompts for network access, request my approval for the domains abov
 3. **📸 Photo Mode (Store Signboard, Menu, or Business Card)**:
    - Use your Vision capability to read the **store name, branch, and address** from the photo (and optionally pass `--image <path>` to extract EXIF GPS), then run:
      `python3 ~/tldreview_tool.py "<Recognized Store Name and Address>" --lang en --markdown` (or add `--lat` / `--lng` if only a brand/store name is visible).
-4. **Report Rules**:
-   - Base your report 100% on the returned review evidence—strictly no hallucination.
-   - Flag rating manipulation (explicitly warn under Operational Insights if reviews mention freebies/discounts for 5-star reviews).
-   - Format output using the 7 sections: 🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts (omit any section that has no direct evidence in the reviews).
+4. **⚔️ Multi-Venue Compare (`--compare`) & 🗺️ Area Discovery (`--top 3`)**:
+   - Compare 2+ stores side-by-side: `python3 ~/tldreview_tool.py "<Store A>" "<Store B>" --compare --lang en --markdown`
+   - Area Discovery + Anti-Manipulation Audit: `python3 ~/tldreview_tool.py "<Category>" --lat <lat> --lng <lng> --top 3 --lang en --markdown`
+5. **Report Rules & Traveler's Point-and-Speak Card**:
+   - Base your report 100% on the returned review evidence and metadata—strictly no hallucination.
+   - Surface `💰 Price`, `🕒 Status`, `🛎️ Service & Options`, and `📋 Latest Menu Photos` in the Digest Header, and integrate `⏳ Popular Times & Wait Time` into `🤫 Insider Tips`.
+   - **🗣️ Traveler's Point-and-Speak Card**: For cross-language lookups, every dish in `🍜 Must-Try / Core Highlights` **MUST include the original local-language dish name in parentheses** (e.g., `Braised Pork Belly (豚の角煮)`).
+   - Format output using the 7 sections: 🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts (omit any section that has no direct evidence).
 ````

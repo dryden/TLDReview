@@ -9,7 +9,7 @@
 🌐 **[Official Website (tldreview.app)](https://tldreview.app/)**
 
 [![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
-[![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)](#-whats-new-changelog)
+[![Version](https://img.shields.io/badge/version-2.0.0-orange.svg)](#-whats-new-changelog)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
@@ -22,19 +22,33 @@
 
 ## 🆕 What's New (Changelog)
 
+### 🚀 v2.0.0
+- 💎 **Zero-Cost Metadata Extraction**: Maximizes SerpApi Place & Review payloads with **zero extra credit usage**:
+  - ⏳ **Popular Times & Wait Time Integration**: Parses `popular_times` (Live Busyness, weekly peak hours, and average stay duration) to warn users about queues in `🤫 Insider Tips`.
+  - 💰 **Price Level, Open State & Service Options**: Surfaces `price` (`$`–`$$$$` or spend range), `open_state` (open now, closing soon, temporarily closed), and `service_options` (dine-in, takeout, accessibility, cash-only) directly in the **Digest Header**.
+  - 📋 **Latest Menu Photo & Price Extractor**: Extracts the newest 1–2 menu/price list photo URLs (`menu_urls`) from menu albums or recent reviews to prevent outdated price hallucinations.
+- ⚔️ **Multi-Venue & Batch Workflows (`--compare` & `--top N`)**:
+  - **Side-by-Side Comparison (`--compare`)**: Pass 2–3 venues to fetch in parallel with scaled token budgets (15 key reviews / 4,000 chars per venue) and generate a side-by-side comparison table (**Must-Try, Red Flags, Wait Time, Price, Best For**).
+  - **Area Discovery + Auto-Audit (`--top 3`)**: Performs 1 LBS search, strips out `Sponsored` ads, audits the top $N$ nearby candidates in parallel for fake-review manipulation, and crowns the **🏆 True Organic Winner**.
+- 🗣️ **Travel & Localization Enhancements**:
+  - **Traveler's Point-and-Speak Card**: For cross-language lookups (`ja`, `ko`, `th`, `fr`, etc.), `🍜 Must-Try / Core Highlights` preserves original local-language dish names in parentheses—e.g., `Braised Pork Belly (豚の角煮)`—so travelers can point at their phone screen to order.
+  - **Chinese Numeral & Brand Alias Normalization**: Normalizes Chinese numerals and store aliases (`五十嵐` ➔ `50嵐`, `85°C`, `7-ELEVEN`) for accurate nearby branch matching.
+
 ### 🎉 v1.1.0
-- 📍 **"Nearby" & Natural-Language Store Search**: In addition to Google Maps URLs, you can now ask directly for nearby stores (e.g., *"FamilyMart near me"* / *"附近的全家便利商店"*). Your AI Agent acquires your current coordinates (`--lat`, `--lng`), filters out sponsored ads, calculates Haversine distances, and jumps straight into the best-matching branch's reviews.
-- 📸 **Store Signboard & Menu Photo Lookup**: Snap and send a photo of a store's signboard, menu, business card, or address plate. Combines AI Vision recognition with built-in zero-dependency EXIF GPS extraction (`--image`) to resolve the store and analyze its reviews.
-- 🧩 **Unified Agent & Tooling Upgrade**: Updated Core CLI, MCP Server, LangChain `@tool`, xAI Grok Bot, Meta Muse, and Master System Prompts to seamlessly support all three query modes.
+- 📍 **"Nearby" & Natural-Language Store Search**: Ask directly for nearby stores (e.g., *"FamilyMart near me"* / *"附近的全家便利商店"*) using `--lat` and `--lng` coordinates.
+- 📸 **Store Signboard & Menu Photo Lookup**: Resolve stores from signboard or menu photos via AI Vision and built-in zero-dependency EXIF GPS extraction (`--image`).
+- 🧩 **Unified Agent & Tooling Upgrade**: Updated Core CLI, MCP Server, LangChain `@tool`, xAI Grok Bot, and Meta Muse integrations.
 
 ---
 
 ## 🦊 What is TL;DReview?
 
-**TL;DReview** ([https://tldreview.app/](https://tldreview.app/)) is a Google Maps review extraction and intelligence engine built for AI Agents and personal assistants. It supports **three intuitive input modes**:
+**TL;DReview** ([https://tldreview.app/](https://tldreview.app/)) is a Google Maps review extraction and intelligence engine built for AI Agents and personal assistants. It supports **five intuitive workflows**:
 1. 🔗 **Paste any Google Maps URL** (including short links & social redirect wrappers)
 2. 📍 **Ask for a "Nearby" Place** (e.g., *"FamilyMart near me"* / *"附近的全家便利商店"*—your AI Agent acquires your current coordinates, searches Google Maps, and jumps straight into the best-matching store's reviews)
 3. 📸 **Send a Photo of a Store Signboard or Menu** (snap a storefront sign, menu, business card, or address plate—the AI extracts the store name/address and analyzes its reviews)
+4. ⚔️ **Compare Multiple Venues Side-by-Side (`--compare`)** (compare 2–3 restaurants or cafes in a single table)
+5. 🗺️ **Scan & Audit Top-N Nearby Places (`--top 3`)** (strip sponsored ads, audit fake reviews, and find the true organic winner nearby)
 
 No matter how you search, TL;DReview distills hundreds of noisy, lengthy reviews into a structured, evidence-backed briefing: **Must-Try Highlights, Strengths, Weaknesses & Red Flags, Insider Tips, Operational Rules, and Transit & Parking**—so you know everything that matters before you go.
 
@@ -205,6 +219,12 @@ python3 core/tldreview_tool.py "Lao Zhang Beef Noodle Taipei Da'an" --lang en --
 
 # 2D. Direct signboard/menu photo input (extracts EXIF GPS automatically; uses GEMINI_API_KEY for CLI OCR)
 python3 core/tldreview_tool.py --image ./signboard.jpg --lang en --markdown
+
+# 2E. Side-by-Side Multi-Venue Comparison (--compare, scales token budget & fetches in parallel)
+python3 core/tldreview_tool.py "Lin Dong Fang Beef Noodle" "Yong Kang Beef Noodle" --compare --lang en --markdown
+
+# 2F. Area Discovery Top-N Scan + Anti-Manipulation Audit (--top 3, strips Sponsored ads & crowns organic winner)
+python3 core/tldreview_tool.py "ramen near me" --lat 25.0330 --lng 121.5654 --top 3 --lang en --markdown
 
 # Advanced options: sort order (newest / lowest / highest) or quota-saving mode (--save-quota)
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en --sort-by newest --save-quota --markdown
