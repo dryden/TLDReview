@@ -91,6 +91,14 @@ export default {
     }
 
     const url = new URL(request.url);
+    if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/vault/health")) {
+      return jsonResponse({
+        status: "ok",
+        service: "tldreview-vault-relay",
+        kv_bound: Boolean(env.VAULT_KV),
+      }, 200);
+    }
+
     const match = url.pathname.match(/^\/v1\/vault\/([A-Za-z0-9_-]+)$/);
     if (!match) {
       return jsonResponse({ status: "error", message: "Not Found" }, 404);

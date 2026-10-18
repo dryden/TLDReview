@@ -3571,6 +3571,18 @@ def vault_status(
                 relay_health["reachable"] = resp.status == 200
                 relay_health["http_status"] = resp.status
                 relay_health["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        except urllib.error.HTTPError as exc:
+            # Even if an older Worker without /health returns 404 JSON {"status":"error","message":"Not Found"},
+            # the Worker endpoint itself is reachable over the network.
+            if exc.code == 404:
+                relay_health["reachable"] = True
+                relay_health["http_status"] = 404
+                relay_health["latency_ms"] = round((time.monotonic() - t0) * 1000)
+            else:
+                diag = _classify_vault_error(exc, url=health_url)
+                relay_health["error_type"] = diag["error_type"]
+                relay_health["error"] = diag["message"]
+                relay_health["hint"] = diag["hint"]
         except Exception as exc:
             diag = _classify_vault_error(exc, url=health_url)
             relay_health["error_type"] = diag["error_type"]
