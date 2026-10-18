@@ -1,0 +1,11 @@
+name = "tldreview-vault-relay"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Bind your Cloudflare KV namespace:
+# Run: `npx wrangler kv namespace create VAULT_KV`
+# and paste the generated id below.
+[[kv_namespaces]]
+binding = "VAULT_KV"
+id = "ae5c8f31a65e4d6fb2468aa564e0e725"
+

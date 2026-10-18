@@ -12,10 +12,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from typing import Optional
 from core.tldreview_tool import (
     format_markdown_output,
+    format_vault_markdown_output,
     resolve_api_key,
     run_compare_pipeline,
     run_pipeline,
     run_top_discovery_pipeline,
+    vault_delete_place,
+    vault_query_places,
+    vault_save_place,
 )
 
 try:
@@ -121,6 +125,108 @@ def summarize_google_maps_reviews(
     return format_markdown_output(result, include_agent_instructions=True)
 
 
+@mcp.tool()
+def tldreview_vault_save(
+    place_id: str = "",
+    name: str = "",
+    status: str = "wishlist",
+    address: str = "",
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    google_rating: Optional[float] = None,
+    user_rating: Optional[float] = None,
+    tags: str = "",
+    must_try: str = "",
+    red_flags: str = "",
+    insider_tips: str = "",
+    user_notes: str = "",
+    sync_key: Optional[str] = None,
+) -> str:
+    """Save or update a restaurant in the user's E2EE Personal Dining Vault (`wishlist`, `liked`, or `disliked`).
+
+    Automatically encrypts and syncs across devices using `TLDREVIEW_SYNC_KEY` (or generates a new key on first save).
+    If a new `TLDREVIEW_SYNC_KEY` is generated, ALWAYS show it to the user and store it in Agent memory!
+
+    Args:
+        place_id: Google Maps data_id or place_id (if known from a previous digest).
+        name: Restaurant / store name (required if place_id is omitted).
+        status: One of `wishlist` (default), `liked`, or `disliked`.
+        address: Store address.
+        lat: Store latitude (for future nearby distance filtering).
+        lng: Store longitude.
+        google_rating: Google Maps average rating.
+        user_rating: User's personal rating (1.0 - 5.0).
+        tags: Comma-separated tags (e.g. "牛肉麵,大安區,長輩友善").
+        must_try: Comma-separated must-try dishes (e.g. "紅燒半筋半肉麵,花椒牛油").
+        red_flags: Comma-separated caveats/red flags (e.g. "湯頭偏鹹,冷氣較弱").
+        insider_tips: Comma-separated insider tips (e.g. "只收現金,11:45前到免排隊").
+        user_notes: User's personal notes or dining memory.
+        sync_key: Optional E2EE sync key (`tld_<vault_id>_<master_secret>`).
+    """
+    try:
+        res = vault_save_place(
+            place_id=place_id or None,
+            name=name or None,
+            address=address or None,
+            lat=lat,
+            lng=lng,
+            google_rating=google_rating,
+            status=status,
+            user_rating=user_rating,
+            tags=tags or None,
+            must_try=must_try or None,
+            red_flags=red_flags or None,
+            insider_tips=insider_tips or None,
+            user_notes=user_notes or None,
+            sync_key=sync_key,
+            api_key=resolve_api_key(),
+        )
+        return format_vault_markdown_output(res)
+    except Exception as exc:
+        return f"Error saving to TLDReview Vault: {exc}"
+
+
+@mcp.tool()
+def tldreview_vault_query(
+    status: str = "all",
+    keyword: Optional[str] = None,
+    tag: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    radius_km: float = 5.0,
+    limit: int = 10,
+    sync_key: Optional[str] = None,
+) -> str:
+    """Query the user's E2EE Personal Dining Vault by status (`wishlist`, `liked`, `disliked`, `all`), keyword, tag, or GPS proximity (0 SerpApi credits).
+
+    Use this tool FIRST when the user asks about their saved restaurants, pocket list, or what is on their wishlist nearby!
+
+    Args:
+        status: Filter by `wishlist`, `liked`, `disliked`, or `all` (default: `all`).
+        keyword: Optional keyword matching name, address, dishes, tags, or personal notes.
+        tag: Optional tag filter (e.g. "牛肉麵" or "大安區").
+        lat: Optional user latitude for Haversine distance filtering & sorting.
+        lng: Optional user longitude for Haversine distance filtering & sorting.
+        radius_km: Search radius in kilometers when `lat`/`lng` are provided (default: 5.0).
+        limit: Maximum number of places to return (default: 10).
+        sync_key: Optional E2EE sync key (`tld_<vault_id>_<master_secret>`).
+    """
+    try:
+        res = vault_query_places(
+            status=status,
+            keyword=keyword,
+            tag=tag,
+            lat=lat,
+            lng=lng,
+            radius_km=radius_km if (lat is not None and lng is not None) else None,
+            limit=limit,
+            sync_key=sync_key,
+        )
+        return format_vault_markdown_output(res)
+    except Exception as exc:
+        return f"Error querying TLDReview Vault: {exc}"
+
+
 @mcp.prompt()
 def tldreview_analysis_prompt(lang: str = "en") -> str:
     """Load the official TL;DReview anti-hallucination system prompt template."""
@@ -141,3 +247,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

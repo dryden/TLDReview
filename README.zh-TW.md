@@ -10,7 +10,7 @@
 🌐 **[專案官網 (Official Website)](https://tldreview.app/)**
 
 [![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
-[![Version](https://img.shields.io/badge/version-2.0.0-orange.svg)](#-版本更新紀錄-whats-new)
+[![Version](https://img.shields.io/badge/version-3.0.0-orange.svg)](#-版本更新紀錄-whats-new)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
@@ -22,6 +22,12 @@
 ---
 
 ## 🆕 版本更新紀錄 (What's New)
+
+### 🧪 v3.0.0（新功能測試中 Beta）
+- 🔒 **專屬你的「AI 美食口袋名單與記憶金庫」（測試中 Beta）**：
+  - **用說的就能存店、記筆記**：看完探店報告覺得心動？直接跟 AI 說「*幫我把這家存進想去清單*」、「*這家我吃過超推，筆記：下次帶爸媽去、湯頭做淡一點*」，或是「*這家太雷了，幫我放進黑名單*」。AI 會連同店家的**必點招牌、避雷提醒、內行撇步**一起幫你記下來！
+  - **走到哪問到哪，完全不扣額度**：出門在外不知道吃什麼時，只要問 AI：「*我現在附近有沒有之前存過想去的店？*」AI 就會根據你的位置，一秒從你的口袋名單中挑出離你最近的餐廳，而且**完全不消耗 SerpApi 查詢額度**。
+  - **免註冊帳號、隱私全加密**：不用註冊任何帳號，第一次存店時系統會自動幫你產生一組專屬同步通行證（`TLDREVIEW_SYNC_KEY`）。你的口袋名單在離開裝置前就會完成端到端加密（E2EE），就算跨對話或換裝置同步，雲端也完全看不到你存了哪些私房名單（亦支援自動匯出至 Obsidian 筆記）。
 
 ### 🚀 v2.0.0
 - 💎 **Google Maps 結構化元數據最大化利用（Zero-Cost Metadata Extraction）**：不額外消耗 SerpApi Credit，直接從回應中提取關鍵情報：
@@ -44,12 +50,14 @@
 
 ## 🦊 TL;DReview 是什麼？
 
-**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。支援 **五種直覺查詢與決策模式**：
+**TL;DReview**（官網：[https://tldreview.app/](https://tldreview.app/)）是一個專為 AI Agent 與個人助手設計的評論分析工具。支援 **六種直覺查詢與個人記憶模式**：
 1. 🔗 **貼上 Google Maps 網址**（含短網址與社群跳轉連結）
 2. 📍 **直接說「附近的店家」**（例如：「*附近的全家便利商店*」——由 AI Agent 取得你目前的座標，自動搜尋並切入最符合結果的店家評論）
 3. 📸 **傳送店家招牌或菜單照片**（拍下店門招牌、菜單、名片或門牌地址，自動辨識店名／地址並直入該店評論）
 4. ⚔️ **多店 PK 橫向比較（`--compare`）**（在 2～3 間猶豫不決的餐廳間直接產出橫向對比表）
 5. 🗺️ **區域探索 Top-N 防洗分掃描（`--top 3`）**（自動剔除廣告、平行掃描附近前 3 名並推薦真正零刷評冠軍）
+6. 🔒 **個人美食口袋名單金庫（`--vault-save` / `--vault-query`，🧪 測試中）**（一句話把好店存進「想去清單 / 喜歡 / 避雷黑名單」，隨時查附近存過的店且完全不扣查詢額度）
+
 
 無論哪種方式，它都會從數百則又長又雜的評論中，整理出一份結構化報告：**必點招牌、優點、缺點與避雷、內行人祕笈、營運規則、交通停車**，讓你在出發前就掌握一個地點的完整細節。
 
@@ -231,6 +239,22 @@ python3 core/tldreview_tool.py "林東芳牛肉麵" "永康牛肉麵" --compare 
 # 2F. 區域探索 Top-N 防洗分掃描（--top 3，剔除 Sponsored 廣告並推薦真正零刷評冠軍店家）
 python3 core/tldreview_tool.py "附近好吃的拉麵" --lat 25.0330 --lng 121.5654 --top 3 --markdown
 
+# 2G. 儲存或更新店家至 E2EE 個人美食金庫（--vault-save）
+python3 core/tldreview_tool.py --vault-save \
+  --place-id "0x3442abcd1234:0x9876efgh" \
+  --name "老張牛肉麵" \
+  --lat 25.0330 --lng 121.5654 \
+  --status wishlist \
+  --tags "牛肉麵,大安區,長輩友善" \
+  --must-try "紅燒半筋半肉麵,花椒牛油" \
+  --red-flags "湯頭偏鹹,冷氣較弱" \
+  --insider-tips "只收現金,11:45前到免排隊" \
+  --user-notes "下次帶爸媽去吃，記得請老闆湯頭做淡一點" \
+  --markdown
+
+# 2H. 查詢個人美食金庫（支援依狀態、關鍵字、標籤或經緯度距離篩選，消耗 0 SerpApi 額度！）
+python3 core/tldreview_tool.py --vault-query --status wishlist --lat 25.0335 --lng 121.5640 --radius-km 3.0 --markdown
+
 # 進階選項：指定排序（newest / lowest / highest）或開啟省額度模式（--save-quota）
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --sort-by newest --save-quota --markdown
 
@@ -241,6 +265,22 @@ python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample"
 pip install -e .
 tldreview "附近的全家便利商店" --lat 25.0330 --lng 121.5654 --markdown
 ```
+
+---
+
+## 🔒 個人美食口袋名單金庫（🧪 測試中 Beta）
+
+每次請 AI 查完餐廳，過幾天就忘記哪家必點什麼、哪家是雷店嗎？現在你可以讓 AI 幫你把好店與避雷筆記「記在腦袋裡」：
+
+- 📌 **一句話收藏分類**：不管是看完報告想加入「**想去清單 (`wishlist`)**」、吃完覺得驚豔想放進「**喜歡名單 (`liked`)**」，還是踩雷後想列為「**拒絕往來戶 (`disliked`)**」，直接跟 AI 說一聲就能存起來，連同必點菜色、排隊撇步和你的個人備註一起打包。
+- 📍 **出門在外秒查附近口袋名單（0 額度消耗）**：逛街到一半不知道吃什麼？直接問 AI：「*我附近有沒有之前存過想去的店？*」系統會直接比對你的座標與口袋名單距離，完全不需要重新上網爬評論，**0 額度消耗、秒級回應**。
+- 🔐 **免註冊、私房名單只有你看得見**：不需要註冊任何帳號！第一次存店時，系統會自動給你一串專屬的「同步金鑰（`TLDREVIEW_SYNC_KEY`）」。你的所有名單跟筆記在電腦或沙盒裡就會先鎖上密碼（端到端加密），就算透過雲端跨裝置同步，連伺服器也看不到你存了什麼店。
+- 📝 **Obsidian 筆記玩家友善**：如果你習慣用 Obsidian 整理生活筆記，只要設定 `TLDREVIEW_OBSIDIAN_DIR` 資料夾路徑，每次存店就會自動幫你產生一張排版漂亮的 Markdown 餐廳卡片！
+
+> [!NOTE]
+> 🧪 **狀態說明**：個人美食口袋名單金庫目前為 **v3.0.0 Beta 測試中功能**，歡迎試用並提供回饋！
+
+
 
 ---
 

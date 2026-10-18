@@ -23,11 +23,14 @@ import base64
 import concurrent.futures
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import json
 import math
 import mimetypes
 import os
 import re
+import secrets
 import struct
 import sys
 import time
@@ -35,6 +38,7 @@ from typing import Any, Iterable, List, Optional, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 # ---------------------------------------------------------------------------
 # Constants & Tunables (Aligned with production tldreview engine)
@@ -1781,6 +1785,8 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
     """Format pipeline result into a structured Markdown digest for CLI, MCP, and LangChain."""
     if result.get("mode") in ("compare", "top_discovery"):
         return format_comparison_markdown_output(result, include_agent_instructions=include_agent_instructions)
+    if result.get("mode") in ("vault_save", "vault_query", "vault_delete", "vault_sync"):
+        return format_vault_markdown_output(result)
 
     p = result.get("place") or {}
     s = result.get("stats") or {}
@@ -1903,6 +1909,7 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
                 "5. **營業狀態與最新價格防呆**：請於開頭 Digest Header 保留 `💰 均消/價位`、`🕒 營業狀態` 與 `🛎️ 服務與設施`；若附有 `📋 最新菜單與價目圖片` 連結，請列出或以最新評論/菜單價格為準，避免舊評論的過時價格幻覺。",
                 "6. **🗣️ 外國旅遊「點餐手指卡 / 生存小抄」**：當來源評論語系與輸出語言不同（如日本/韓國/泰國/法國等跨語言查詢）時，「🍜 必點招牌 / 核心亮點」中的每一道推薦品項**必須保留當地語言原始菜名對照**（例如：`炙燒和牛握壽司 (炙り和牛握り)` 或 `Braised Pork Belly (豚の角煮)`），方便旅客直接把手機螢幕指給店員看完成點餐。",
                 "7. **7 大標準維度**：🍜 必點招牌 / 核心亮點、👍 優勢與推薦點、👎 缺點與避雷提醒、💡 營運洞察與消費規則、🤫 內行人的秘密撇步、🚗 交通與停車指南、🚨 特別點名。",
+                "8. **🔒 結尾個人美食金庫提示（Post-Digest Nudge）**：於報告最後加上一行溫馨提示：「💡 *想把這間店加入『想去清單 (wishlist)』或標記為『喜歡 (liked) / 避雷 (disliked)』嗎？隨時告訴我即可為您加密儲存！*」",
             ])
         else:
             lines.extend([
@@ -1917,6 +1924,7 @@ def format_markdown_output(result: dict, include_agent_instructions: bool = Fals
                 "5. **Open State, Price & Latest Menu Guardrails**: Include `💰 Price`, `🕒 Status`, and `🛎️ Service & Options` in the Digest Header. If `📋 Latest Menu & Price Photos` URLs are present, surface them and prioritize recent prices over outdated review prices.",
                 "6. **🗣️ Traveler's Point-and-Speak Card**: Whenever the review source language differs from the output language (`cross_language`), every recommended dish in '🍜 Must-Try / Core Highlights' **MUST include the original local-language dish name in parentheses** (e.g., `Braised Pork Belly (豚の角煮)`), so travelers can point at their phone screen to order.",
                 "7. **7 Standard Sections**: 🍜 Must-Try / Core Highlights, 👍 Strengths & Pros, 👎 Weaknesses & Red Flags, 💡 Operational Insights & Rules, 🤫 Insider Tips, 🚗 Transit & Parking, 🚨 Notable Callouts.",
+                "8. **🔒 Post-Digest Vault Nudge**: At the end of the report, append a brief 1-line note: *\"💡 Want to save this place to your `wishlist` or mark it as `liked` / `disliked` in your Personal Dining Vault? Just let me know!\"*",
             ])
 
     return "\n".join(lines)
@@ -2536,13 +2544,880 @@ def run_top_discovery_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Step 5: Zero-Dependency E2EE Cloud Vault (Personal Dining Memory)
+# ---------------------------------------------------------------------------
+VAULT_API_DEFAULT_BASE = "https://tldreview-vault-relay.cloudflare-d19.workers.dev/v1/vault"
+VAULT_HTTP_TIMEOUT = 10.0
+VALID_VAULT_STATUSES = ("wishlist", "liked", "disliked")
+_VAULT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{12,32}$")
+_VAULT_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
+
+
+class VaultError(ValueError):
+    """Base exception for TL;DReview Personal Dining Vault operations."""
+
+
+class VaultDecryptionError(VaultError):
+    """Raised when E2EE envelope HMAC verification or decryption fails."""
+
+
+def generate_sync_key() -> str:
+    """Generate a high-entropy E2EE Sync Key: tld_<vault_id>_<master_secret>."""
+    # Generate 16-char vault_id without underscores so splitting on '_' is unambiguous
+    vault_id = "".join(secrets.choice(_VAULT_ALPHABET) for _ in range(16))
+    master_secret = secrets.token_urlsafe(32)
+    return f"tld_{vault_id}_{master_secret}"
+
+
+def parse_sync_key(sync_key: str) -> Tuple[str, str]:
+    """Parse and validate a Sync Key into (vault_id, master_secret)."""
+    raw = (sync_key or "").strip()
+    if not raw.startswith("tld_"):
+        raise VaultError("Invalid Sync Key format: must start with 'tld_'.")
+    body = raw[4:]
+    # Handle standard 16-char vault_id even if a custom vault_id contained an underscore
+    if len(body) > 17 and body[16] == "_":
+        vault_id = body[:16]
+        master_secret = body[17:]
+    elif "_" in body:
+        vault_id, master_secret = body.split("_", 1)
+    else:
+        raise VaultError("Invalid Sync Key format: expected 'tld_<vault_id>_<master_secret>'.")
+
+    if not _VAULT_ID_RE.fullmatch(vault_id):
+        raise VaultError(f"Invalid vault_id '{vault_id}' in Sync Key (must be 12-32 URL-safe chars).")
+    if len(master_secret) < 16:
+        raise VaultError("Invalid master_secret in Sync Key (must be at least 16 characters).")
+    return vault_id, master_secret
+
+
+def derive_write_token(sync_key_or_vault_id: str, master_secret: Optional[str] = None) -> str:
+    """Derive the server authentication Bearer token from a Sync Key or (vault_id, master_secret)."""
+    if master_secret is None:
+        vault_id, master_secret = parse_sync_key(sync_key_or_vault_id)
+    else:
+        vault_id = sync_key_or_vault_id
+    return hmac.new(
+        master_secret.encode("utf-8"),
+        b"tldreview-auth-v1:" + vault_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def derive_subkeys(master_secret: str, nonce: bytes) -> Tuple[bytes, bytes]:
+    """Derive 32-byte encryption key and 32-byte MAC key from master_secret and 16-byte nonce."""
+    if len(nonce) != 16:
+        raise ValueError("Encryption nonce must be exactly 16 bytes.")
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        master_secret.encode("utf-8"),
+        nonce,
+        iterations=100_000,
+        dklen=64,
+    )
+    return dk[:32], dk[32:64]
+
+
+def _blake2b_ctr_xor(data: bytes, enc_key: bytes, nonce: bytes) -> bytes:
+    """XOR data with a BLAKE2b counter-mode keystream (64 bytes per block)."""
+    if not data:
+        return b""
+    out = bytearray(len(data))
+    num_blocks = (len(data) + 63) // 64
+    for i in range(num_blocks):
+        ks_block = hashlib.blake2b(
+            nonce + i.to_bytes(8, "big"),
+            key=enc_key,
+            digest_size=64,
+        ).digest()
+        start = i * 64
+        chunk = data[start : start + 64]
+        for j, b in enumerate(chunk):
+            out[start + j] = b ^ ks_block[j]
+    return bytes(out)
+
+
+def encrypt_vault_payload(plaintext_obj: dict[str, Any], sync_key: str) -> dict[str, Any]:
+    """Compress and encrypt a plaintext Vault dict into a v1 E2EE JSON envelope."""
+    _, master_secret = parse_sync_key(sync_key)
+    plaintext_bytes = json.dumps(
+        plaintext_obj, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    compressed = zlib.compress(plaintext_bytes)
+    nonce = secrets.token_bytes(16)
+    enc_key, mac_key = derive_subkeys(master_secret, nonce)
+    ciphertext = _blake2b_ctr_xor(compressed, enc_key, nonce)
+    tag = hmac.new(mac_key, b"v1" + nonce + ciphertext, hashlib.sha256).digest()
+    return {
+        "v": 1,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ct": base64.b64encode(ciphertext).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii"),
+        "updated_at": int(time.time()),
+    }
+
+
+def decrypt_vault_payload(envelope: dict[str, Any], sync_key: str) -> dict[str, Any]:
+    """Verify HMAC and decrypt a v1 E2EE JSON envelope back into a plaintext Vault dict."""
+    if not isinstance(envelope, dict) or envelope.get("v") != 1:
+        raise VaultDecryptionError("Unsupported or malformed vault envelope version.")
+
+    try:
+        nonce = base64.b64decode(str(envelope["nonce"]), validate=True)
+        ciphertext = base64.b64decode(str(envelope["ct"]), validate=True)
+        received_tag = base64.b64decode(str(envelope["tag"]), validate=True)
+    except Exception as exc:
+        raise VaultDecryptionError(f"Invalid base64 encoding in vault envelope: {exc}") from None
+
+    if len(nonce) != 16 or len(received_tag) != 32:
+        raise VaultDecryptionError("Invalid nonce or MAC tag length in vault envelope.")
+
+    _, master_secret = parse_sync_key(sync_key)
+    enc_key, mac_key = derive_subkeys(master_secret, nonce)
+    expected_tag = hmac.new(mac_key, b"v1" + nonce + ciphertext, hashlib.sha256).digest()
+
+    if not hmac.compare_digest(expected_tag, received_tag):
+        raise VaultDecryptionError(
+            "Vault HMAC verification failed: ciphertext/nonce was tampered with or Sync Key is incorrect."
+        )
+
+    try:
+        compressed = _blake2b_ctr_xor(ciphertext, enc_key, nonce)
+        plaintext_bytes = zlib.decompress(compressed)
+        data = json.loads(plaintext_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise VaultDecryptionError(f"Failed to decompress or parse decrypted vault payload: {exc}") from None
+
+    if not isinstance(data, dict):
+        raise VaultDecryptionError("Decrypted vault payload is not a JSON object.")
+    return data
+
+
+def _vault_base_dir() -> str:
+    return os.getenv("TLDREVIEW_VAULT_DIR") or os.path.join(
+        os.path.expanduser("~"), ".tldreview"
+    )
+
+
+def get_vault_path() -> str:
+    """Return local plaintext cache path (~/.tldreview/vault.json or TLDREVIEW_VAULT_PATH)."""
+    return os.getenv("TLDREVIEW_VAULT_PATH") or os.path.join(_vault_base_dir(), "vault.json")
+
+
+def get_sync_key_path() -> str:
+    """Return local sync key file path (~/.tldreview/sync.key or TLDREVIEW_SYNC_KEY_PATH)."""
+    return os.getenv("TLDREVIEW_SYNC_KEY_PATH") or os.path.join(_vault_base_dir(), "sync.key")
+
+
+def _persist_sync_key_file(sync_key: str) -> None:
+    key_path = get_sync_key_path()
+    try:
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        with open(key_path, "w", encoding="utf-8") as f:
+            f.write(sync_key.strip() + "\n")
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        log(f"Warning: unable to save sync key to {key_path}: {exc}")
+
+
+def resolve_sync_key(
+    explicit_key: Optional[str] = None,
+    auto_create: bool = False,
+) -> Tuple[Optional[str], bool]:
+    """Resolve Sync Key from CLI arg -> TLDREVIEW_SYNC_KEY env -> ~/.tldreview/sync.key -> auto-generate."""
+    if explicit_key and explicit_key.strip():
+        clean = explicit_key.strip()
+        parse_sync_key(clean)
+        _persist_sync_key_file(clean)
+        return clean, False
+
+    load_dotenv_if_present()
+    env_key = os.getenv("TLDREVIEW_SYNC_KEY", "").strip()
+    if env_key:
+        parse_sync_key(env_key)
+        return env_key, False
+
+    key_path = get_sync_key_path()
+    if os.path.isfile(key_path):
+        try:
+            with open(key_path, "r", encoding="utf-8") as f:
+                saved = f.read().strip()
+            if saved:
+                parse_sync_key(saved)
+                return saved, False
+        except (OSError, ValueError):
+            pass
+
+    if auto_create:
+        new_key = generate_sync_key()
+        _persist_sync_key_file(new_key)
+        return new_key, True
+
+    return None, False
+
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _empty_vault() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "updated_at": _now_iso_utc(),
+        "sync_pending": False,
+        "places": {},
+    }
+
+
+def load_local_vault(vault_path: Optional[str] = None) -> dict[str, Any]:
+    """Load local vault.json or return an initialized empty vault schema."""
+    path = vault_path or get_vault_path()
+    if not os.path.isfile(path):
+        return _empty_vault()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("places"), dict):
+            data.setdefault("schema_version", 1)
+            data.setdefault("updated_at", _now_iso_utc())
+            data.setdefault("sync_pending", False)
+            return data
+    except (OSError, ValueError) as exc:
+        log(f"Warning: could not read local vault {path}: {exc}")
+    return _empty_vault()
+
+
+def save_local_vault(vault_data: dict[str, Any], vault_path: Optional[str] = None) -> str:
+    """Persist vault data to ~/.tldreview/vault.json with 0600 permissions."""
+    path = vault_path or get_vault_path()
+    vault_data["schema_version"] = 1
+    vault_data["updated_at"] = _now_iso_utc()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(vault_data, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def _vault_api_url(vault_id: str) -> str:
+    base = (os.getenv("TLDREVIEW_VAULT_API_URL") or VAULT_API_DEFAULT_BASE).rstrip("/")
+    return f"{base}/{urllib.parse.quote(vault_id)}"
+
+
+def _cloud_vault_put(vault_data: dict[str, Any], sync_key: str) -> bool:
+    """Encrypt and PUT vault data to Cloudflare Worker KV relay. Returns True on success."""
+    if os.getenv("TLDREVIEW_VAULT_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    vault_id, _ = parse_sync_key(sync_key)
+    write_token = derive_write_token(sync_key)
+    # Strip local-only sync_pending flag from encrypted cloud payload
+    clean_payload = {
+        "schema_version": vault_data.get("schema_version", 1),
+        "updated_at": vault_data.get("updated_at") or _now_iso_utc(),
+        "places": vault_data.get("places") or {},
+    }
+    envelope = encrypt_vault_payload(clean_payload, sync_key)
+    body_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+
+    req = urllib.request.Request(
+        _vault_api_url(vault_id),
+        data=body_bytes,
+        headers={
+            "Authorization": f"Bearer {write_token}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+            return resp.status in (200, 201)
+    except Exception as exc:
+        log(f"Cloud Vault sync skipped/offline (saved locally): {exc}")
+        return False
+
+
+def _cloud_vault_get(sync_key: str) -> Optional[dict[str, Any]]:
+    """GET and decrypt remote vault from Cloudflare Worker KV relay. Returns None if 404 or unreachable."""
+    if os.getenv("TLDREVIEW_VAULT_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    vault_id, _ = parse_sync_key(sync_key)
+    req = urllib.request.Request(
+        _vault_api_url(vault_id),
+        headers={
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            envelope = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        log(f"Cloud Vault GET HTTP {exc.code}: {exc}")
+        return None
+    except Exception as exc:
+        log(f"Cloud Vault GET unreachable: {exc}")
+        return None
+
+    return decrypt_vault_payload(envelope, sync_key)
+
+
+def _split_csv_items(val: Any) -> list[str]:
+    """Parse a comma/頓號/semicolon-separated string or list of strings into clean items."""
+    if not val:
+        return []
+    if isinstance(val, list):
+        raw_items = [str(x) for x in val]
+    else:
+        raw_items = re.split(r"[,，、;\n]+", str(val))
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        clean = item.strip()
+        if clean and clean.casefold() not in seen:
+            seen.add(clean.casefold())
+            result.append(clean)
+    return result
+
+
+def _merge_unique_str_list(existing: Optional[list[str]], incoming: Optional[list[str]]) -> list[str]:
+    """Merge two lists of strings preserving order and case-insensitive uniqueness."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in (existing or []) + (incoming or []):
+        clean = str(item or "").strip()
+        if clean and clean.casefold() not in seen:
+            seen.add(clean.casefold())
+            merged.append(clean)
+    return merged
+
+
+def _merge_place_records(old_rec: dict[str, Any], new_rec: dict[str, Any]) -> dict[str, Any]:
+    """Merge an incoming place record into an existing place record per Upsert & Deduplication rules."""
+    status = str(new_rec.get("status") or old_rec.get("status") or "wishlist").lower()
+    if status not in VALID_VAULT_STATUSES:
+        status = "wishlist"
+
+    now_iso = _now_iso_utc()
+    old_visited = old_rec.get("visited_at")
+    new_visited = new_rec.get("visited_at")
+    if status in ("liked", "disliked"):
+        visited_at = new_visited or old_visited or now_iso
+        if old_rec.get("status") == "wishlist":
+            visited_at = new_visited or now_iso
+    else:
+        visited_at = new_visited if new_visited is not None else old_visited
+
+    old_notes = str(old_rec.get("user_notes") or "").strip()
+    inc_notes = str(new_rec.get("user_notes") or "").strip()
+    if inc_notes and old_notes and inc_notes != old_notes and inc_notes not in old_notes:
+        merged_notes = f"{old_notes} | {inc_notes}"
+    else:
+        merged_notes = inc_notes or old_notes
+
+    return {
+        "place_id": new_rec.get("place_id") or old_rec.get("place_id"),
+        "name": new_rec.get("name") or old_rec.get("name") or "Unknown Place",
+        "address": new_rec.get("address") or old_rec.get("address"),
+        "lat": new_rec.get("lat") if new_rec.get("lat") is not None else old_rec.get("lat"),
+        "lng": new_rec.get("lng") if new_rec.get("lng") is not None else old_rec.get("lng"),
+        "status": status,
+        "user_rating": (
+            new_rec.get("user_rating")
+            if new_rec.get("user_rating") is not None
+            else old_rec.get("user_rating")
+        ),
+        "google_rating": (
+            new_rec.get("google_rating")
+            if new_rec.get("google_rating") is not None
+            else old_rec.get("google_rating")
+        ),
+        "tags": _merge_unique_str_list(old_rec.get("tags"), new_rec.get("tags")),
+        "must_try": _merge_unique_str_list(old_rec.get("must_try"), new_rec.get("must_try")),
+        "red_flags": _merge_unique_str_list(old_rec.get("red_flags"), new_rec.get("red_flags")),
+        "insider_tips": _merge_unique_str_list(old_rec.get("insider_tips"), new_rec.get("insider_tips")),
+        "user_notes": merged_notes,
+        "url": new_rec.get("url") or old_rec.get("url"),
+        "saved_at": new_rec.get("saved_at") or now_iso,
+        "visited_at": visited_at,
+    }
+
+
+def export_obsidian_markdown(place_rec: dict[str, Any], obsidian_dir: Optional[str] = None) -> Optional[str]:
+    """Write a Markdown note with YAML frontmatter to TLDREVIEW_OBSIDIAN_DIR if configured."""
+    target_dir = (obsidian_dir or os.getenv("TLDREVIEW_OBSIDIAN_DIR") or "").strip()
+    if not target_dir:
+        return None
+    raw_name = str(place_rec.get("name") or place_rec.get("place_id") or "place").strip()
+    safe_name = re.sub(r'[\\/:*?"<>|\r\n]+', "_", raw_name).strip(" ._") or "place"
+    os.makedirs(target_dir, exist_ok=True)
+    file_path = os.path.join(target_dir, f"{safe_name}.md")
+
+    tags_yaml = json.dumps(place_rec.get("tags") or [], ensure_ascii=False)
+    frontmatter = [
+        "---",
+        f'place_id: "{place_rec.get("place_id") or ""}"',
+        f'name: "{raw_name}"',
+        f'status: "{place_rec.get("status") or "wishlist"}"',
+        f"user_rating: {json.dumps(place_rec.get('user_rating'))}",
+        f"google_rating: {json.dumps(place_rec.get('google_rating'))}",
+        f"lat: {json.dumps(place_rec.get('lat'))}",
+        f"lng: {json.dumps(place_rec.get('lng'))}",
+        f"tags: {tags_yaml}",
+        f'saved_at: "{place_rec.get("saved_at") or ""}"',
+        f"visited_at: {json.dumps(place_rec.get('visited_at'))}",
+        "---",
+        "",
+        f"# {raw_name}",
+        "",
+    ]
+    if place_rec.get("address"):
+        frontmatter.append(f"- **Address**: {place_rec['address']}")
+    if place_rec.get("url"):
+        frontmatter.append(f"- **Google Maps**: {place_rec['url']}")
+    if place_rec.get("must_try"):
+        frontmatter.append(f"- **Must-Try**: {', '.join(place_rec['must_try'])}")
+    if place_rec.get("red_flags"):
+        frontmatter.append(f"- **Red Flags**: {', '.join(place_rec['red_flags'])}")
+    if place_rec.get("insider_tips"):
+        frontmatter.append(f"- **Insider Tips**: {', '.join(place_rec['insider_tips'])}")
+    if place_rec.get("user_notes"):
+        frontmatter.extend(["", "## Personal Notes", str(place_rec["user_notes"])])
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(frontmatter) + "\n")
+    return file_path
+
+
+def vault_save_place(
+    place_id: Optional[str] = None,
+    name: Optional[str] = None,
+    address: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    google_rating: Optional[float] = None,
+    status: str = "wishlist",
+    user_rating: Optional[float] = None,
+    tags: Any = None,
+    must_try: Any = None,
+    red_flags: Any = None,
+    insider_tips: Any = None,
+    user_notes: Optional[str] = None,
+    url: Optional[str] = None,
+    raw_input: Optional[str] = None,
+    sync_key: Optional[str] = None,
+    api_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Save or update a place in the local E2EE Vault and sync to Cloud Relay."""
+    norm_status = (status or "wishlist").strip().lower()
+    if norm_status not in VALID_VAULT_STATUSES:
+        raise ValueError(f"Invalid vault status '{status}'. Must be one of: {', '.join(VALID_VAULT_STATUSES)}")
+
+    # Auto-lookup convenience if raw_input / URL is provided
+    target_str = (raw_input or url or "").strip()
+    if target_str and (not place_id or not name):
+        extracted_url = extract_google_maps_url(target_str)
+        if extracted_url:
+            url = url or extracted_url
+            resolved = resolve_short_url(extracted_url)
+            extracted_id = extract_maps_data_id(resolved)
+            if extracted_id and not place_id:
+                place_id = extracted_id
+            coords = extract_coordinates(resolved)
+            if coords and (lat is None or lng is None):
+                lat, lng = coords
+        if place_id:
+            cached = _cache_load(_cache_path(place_id))
+            if cached and isinstance(cached.get("place"), dict):
+                cp = cached["place"]
+                name = name or cp.get("name")
+                address = address or cp.get("address")
+                if google_rating is None and cp.get("average_rating") is not None:
+                    google_rating = float(cp["average_rating"])
+        if not name and not extracted_url:
+            name = target_str
+
+    if not name and not place_id:
+        raise ValueError("vault_save_place requires at least --name, --place-id, or a place URL/query.")
+
+    if not place_id:
+        norm_name = _normalize_for_match(name or "place")
+        coord_part = f"{lat:.4f},{lng:.4f}" if (lat is not None and lng is not None) else ""
+        digest = hashlib.sha256(f"{norm_name}:{coord_part}".encode("utf-8")).hexdigest()[:16]
+        place_id = f"custom_{digest}"
+
+    now_iso = _now_iso_utc()
+    vault = load_local_vault(vault_path)
+    places = vault.setdefault("places", {})
+
+    existing = places.get(place_id)
+    # Also check if an existing place matches by normalized name when custom place_id was generated
+    if existing is None and place_id.startswith("custom_") and name:
+        for pid, prec in places.items():
+            if _normalize_for_match(str(prec.get("name") or "")) == _normalize_for_match(name):
+                place_id = pid
+                existing = prec
+                break
+
+    incoming_rec: dict[str, Any] = {
+        "place_id": place_id,
+        "name": name or (existing or {}).get("name") or place_id,
+        "address": address,
+        "lat": float(lat) if lat is not None else None,
+        "lng": float(lng) if lng is not None else None,
+        "status": norm_status,
+        "user_rating": float(user_rating) if user_rating is not None else None,
+        "google_rating": float(google_rating) if google_rating is not None else None,
+        "tags": _split_csv_items(tags),
+        "must_try": _split_csv_items(must_try),
+        "red_flags": _split_csv_items(red_flags),
+        "insider_tips": _split_csv_items(insider_tips),
+        "user_notes": (user_notes or "").strip(),
+        "url": url,
+        "saved_at": now_iso,
+        "visited_at": now_iso if norm_status in ("liked", "disliked") else None,
+    }
+
+    if existing:
+        merged_rec = _merge_place_records(existing, incoming_rec)
+    else:
+        merged_rec = incoming_rec
+
+    places[place_id] = merged_rec
+
+    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True)
+    cloud_synced = False
+    if resolved_key:
+        cloud_synced = _cloud_vault_put(vault, resolved_key)
+    vault["sync_pending"] = not cloud_synced
+    saved_file = save_local_vault(vault, vault_path)
+    obsidian_file = export_obsidian_markdown(merged_rec)
+
+    res: dict[str, Any] = {
+        "status": "success",
+        "mode": "vault_save",
+        "action": "updated" if existing else "created",
+        "place": merged_rec,
+        "total_saved_places": len(places),
+        "vault_path": saved_file,
+        "cloud_synced": cloud_synced,
+        "sync_pending": vault["sync_pending"],
+        "new_sync_key_generated": is_new_key,
+    }
+    if is_new_key and resolved_key:
+        res["sync_key"] = resolved_key
+    if obsidian_file:
+        res["obsidian_path"] = obsidian_file
+    return res
+
+
+def vault_query_places(
+    status: str = "all",
+    keyword: Optional[str] = None,
+    tag: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    radius_km: Optional[float] = None,
+    limit: int = 10,
+    sync_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Query saved places in the Vault with status, keyword, tag, and Haversine radius filtering (0 SerpApi credits)."""
+    vault = load_local_vault(vault_path)
+    resolved_key, _ = resolve_sync_key(sync_key, auto_create=False)
+
+    # Hydrate from cloud if local vault has no places yet and a sync key is available
+    if not vault.get("places") and resolved_key:
+        remote_vault = _cloud_vault_get(resolved_key)
+        if remote_vault and isinstance(remote_vault.get("places"), dict):
+            vault["places"] = remote_vault["places"]
+            vault["sync_pending"] = False
+            save_local_vault(vault, vault_path)
+
+    places_map: dict[str, dict[str, Any]] = vault.get("places") or {}
+    norm_status = (status or "all").strip().lower()
+    kw_norm = (keyword or "").strip().casefold()
+    tag_norm = (tag or "").strip().casefold()
+    has_coords = lat is not None and lng is not None
+    effective_radius_km = float(radius_km) if radius_km is not None else (5.0 if has_coords else None)
+
+    matched: list[dict[str, Any]] = []
+    for pid, rec in places_map.items():
+        if not isinstance(rec, dict):
+            continue
+        rec_status = str(rec.get("status") or "wishlist").lower()
+        if norm_status not in ("all", "") and rec_status != norm_status:
+            continue
+
+        if tag_norm:
+            rec_tags = [str(t).casefold() for t in (rec.get("tags") or [])]
+            if not any(tag_norm in rt for rt in rec_tags):
+                continue
+
+        if kw_norm:
+            searchable_blob = " ".join([
+                str(rec.get("name") or ""),
+                str(rec.get("address") or ""),
+                " ".join(str(x) for x in (rec.get("tags") or [])),
+                " ".join(str(x) for x in (rec.get("must_try") or [])),
+                " ".join(str(x) for x in (rec.get("red_flags") or [])),
+                " ".join(str(x) for x in (rec.get("insider_tips") or [])),
+                str(rec.get("user_notes") or ""),
+            ]).casefold()
+            if kw_norm not in searchable_blob:
+                continue
+
+        item = dict(rec)
+        if has_coords and lat is not None and lng is not None:
+            p_lat = item.get("lat")
+            p_lng = item.get("lng")
+            if p_lat is None or p_lng is None:
+                continue
+            dist_m = haversine_distance_m(lat, lng, float(p_lat), float(p_lng))
+            dist_km = round(dist_m / 1000.0, 3)
+            if effective_radius_km is not None and dist_km > effective_radius_km:
+                continue
+            item["distance_km"] = dist_km
+            item["distance_m"] = dist_m
+
+        matched.append(item)
+
+    if has_coords:
+        matched.sort(key=lambda x: (x.get("distance_km", 10**9), str(x.get("name") or "")))
+    else:
+        matched.sort(key=lambda x: str(x.get("saved_at") or ""), reverse=True)
+
+    max_items = max(1, int(limit or 10))
+    return {
+        "status": "success",
+        "mode": "vault_query",
+        "filters": {
+            "status": norm_status,
+            "keyword": keyword,
+            "tag": tag,
+            "lat": lat,
+            "lng": lng,
+            "radius_km": effective_radius_km,
+        },
+        "total_in_vault": len(places_map),
+        "matched_count": len(matched),
+        "places": matched[:max_items],
+    }
+
+
+def vault_delete_place(
+    place_id: Optional[str] = None,
+    name: Optional[str] = None,
+    sync_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Delete a saved place from the Vault by place_id or exact/fuzzy name match."""
+    if not place_id and not name:
+        raise ValueError("vault_delete_place requires --place-id or --name.")
+
+    vault = load_local_vault(vault_path)
+    places: dict[str, dict[str, Any]] = vault.get("places") or {}
+    removed: list[dict[str, Any]] = []
+
+    if place_id and place_id in places:
+        removed.append(places.pop(place_id))
+    elif name:
+        target_norm = _normalize_for_match(name)
+        target_cf = name.strip().casefold()
+        to_delete = [
+            pid for pid, rec in places.items()
+            if (
+                str(rec.get("name") or "").strip().casefold() == target_cf
+                or _normalize_for_match(str(rec.get("name") or "")) == target_norm
+                or _query_matches_title(name, str(rec.get("name") or ""))
+            )
+        ]
+        for pid in to_delete:
+            removed.append(places.pop(pid))
+
+    cloud_synced = False
+    if removed:
+        resolved_key, _ = resolve_sync_key(sync_key, auto_create=False)
+        if resolved_key:
+            cloud_synced = _cloud_vault_put(vault, resolved_key)
+        vault["sync_pending"] = not cloud_synced
+        save_local_vault(vault, vault_path)
+
+    return {
+        "status": "success",
+        "mode": "vault_delete",
+        "deleted_count": len(removed),
+        "deleted": removed,
+        "remaining_count": len(places),
+        "cloud_synced": cloud_synced,
+    }
+
+
+def vault_sync(
+    sync_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Pull remote encrypted vault, decrypt, merge with local items (most recent saved_at wins), and push back."""
+    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True)
+    if not resolved_key:
+        raise VaultError("Unable to resolve or generate TLDREVIEW_SYNC_KEY.")
+
+    local_vault = load_local_vault(vault_path)
+    local_places: dict[str, dict[str, Any]] = local_vault.get("places") or {}
+
+    remote_vault = _cloud_vault_get(resolved_key)
+    remote_places: dict[str, dict[str, Any]] = (
+        remote_vault.get("places") if isinstance(remote_vault, dict) and isinstance(remote_vault.get("places"), dict) else {}
+    )
+
+    merged_places: dict[str, dict[str, Any]] = {}
+    all_pids = set(local_places.keys()) | set(remote_places.keys())
+    for pid in all_pids:
+        l_rec = local_places.get(pid)
+        r_rec = remote_places.get(pid)
+        if l_rec and r_rec:
+            l_time = str(l_rec.get("saved_at") or "")
+            r_time = str(r_rec.get("saved_at") or "")
+            if r_time > l_time:
+                merged_places[pid] = _merge_place_records(l_rec, r_rec)
+            else:
+                merged_places[pid] = _merge_place_records(r_rec, l_rec)
+        elif l_rec:
+            merged_places[pid] = l_rec
+        elif r_rec:
+            merged_places[pid] = r_rec
+
+    local_vault["places"] = merged_places
+    cloud_synced = _cloud_vault_put(local_vault, resolved_key)
+    local_vault["sync_pending"] = not cloud_synced
+    saved_file = save_local_vault(local_vault, vault_path)
+
+    res: dict[str, Any] = {
+        "status": "success",
+        "mode": "vault_sync",
+        "total_places": len(merged_places),
+        "pulled_remote_places": len(remote_places),
+        "cloud_synced": cloud_synced,
+        "sync_pending": local_vault["sync_pending"],
+        "vault_path": saved_file,
+        "new_sync_key_generated": is_new_key,
+    }
+    if is_new_key:
+        res["sync_key"] = resolved_key
+    return res
+
+
+def format_vault_markdown_output(result: dict) -> str:
+    """Format Vault save/query/delete/sync results into clean human & Agent-friendly Markdown."""
+    mode = result.get("mode")
+    lines: list[str] = []
+
+    if mode == "vault_save":
+        p = result.get("place") or {}
+        action_zh = "已更新" if result.get("action") == "updated" else "已新增"
+        status_badge = {
+            "wishlist": "📌 想去清單 (wishlist)",
+            "liked": "❤️ 喜歡/推薦 (liked)",
+            "disliked": "💣 避雷黑名單 (disliked)",
+        }.get(str(p.get("status") or "wishlist"), str(p.get("status")))
+        lines.append(f"# 🔒 TL;DReview 個人美食金庫 ({action_zh})：{p.get('name')}")
+        lines.append(f"- **狀態**: {status_badge} | **Place ID**: `{p.get('place_id')}`")
+        if p.get("address"):
+            lines.append(f"- **地址**: {p['address']}")
+        if p.get("google_rating") is not None or p.get("user_rating") is not None:
+            lines.append(
+                f"- **評分**: Google ⭐ {p.get('google_rating', 'N/A')} | 個人評分 ⭐ {p.get('user_rating', 'N/A')}"
+            )
+        if p.get("tags"):
+            lines.append(f"- **標籤 (Tags)**: {', '.join(p['tags'])}")
+        if p.get("must_try"):
+            lines.append(f"- **🍜 必點招牌**: {', '.join(p['must_try'])}")
+        if p.get("red_flags"):
+            lines.append(f"- **👎 避雷提醒**: {', '.join(p['red_flags'])}")
+        if p.get("insider_tips"):
+            lines.append(f"- **🤫 內行撇步**: {', '.join(p['insider_tips'])}")
+        if p.get("user_notes"):
+            lines.append(f"- **📝 個人筆記**: {p['user_notes']}")
+        sync_state = "✅ 已 E2EE 端到端加密同步至雲端" if result.get("cloud_synced") else "💾 已儲存於本地快取 (待連線同步)"
+        lines.append(f"- **同步狀態**: {sync_state} (金庫共 {result.get('total_saved_places', 1)} 間店)")
+        if result.get("new_sync_key_generated") and result.get("sync_key"):
+            lines.extend([
+                "",
+                "> [!IMPORTANT]",
+                f"> 🔑 **首次自動產生 E2EE 跨裝置同步金鑰 (`TLDREVIEW_SYNC_KEY`)**：",
+                f"> `{result['sync_key']}`",
+                "> 請將此金鑰顯示給使用者並存入 AI Agent 記憶（Memory）或環境變數 `TLDREVIEW_SYNC_KEY`，未來在任何雲端沙盒皆可無縫同步個人清單！",
+            ])
+        return "\n".join(lines)
+
+    if mode == "vault_query":
+        places = result.get("places") or []
+        f_meta = result.get("filters") or {}
+        lines.append(
+            f"# 🗂️ TL;DReview 個人美食金庫查詢結果 (符合 {result.get('matched_count', 0)} / 總計 {result.get('total_in_vault', 0)} 間)"
+        )
+        if not places:
+            lines.append("\n*(目前沒有符合篩選條件的已儲存店家)*")
+            return "\n".join(lines)
+        for idx, p in enumerate(places, 1):
+            st = str(p.get("status") or "wishlist")
+            icon = {"wishlist": "📌", "liked": "❤️", "disliked": "💣"}.get(st, "📌")
+            dist_str = f" | 📍 距離 {p['distance_km']:.2f} km" if p.get("distance_km") is not None else ""
+            g_str = f" | Google ⭐{p['google_rating']}" if p.get("google_rating") is not None else ""
+            u_str = f" | 個人 ⭐{p['user_rating']}" if p.get("user_rating") is not None else ""
+            lines.append(f"## [{idx}] {icon} {p.get('name')} (`{st}`{dist_str}{g_str}{u_str})")
+            if p.get("address"):
+                lines.append(f"- **地址**: {p['address']}")
+            if p.get("tags"):
+                lines.append(f"- **標籤**: {', '.join(p['tags'])}")
+            if p.get("must_try"):
+                lines.append(f"- **🍜 必點**: {', '.join(p['must_try'])}")
+            if p.get("red_flags"):
+                lines.append(f"- **👎 雷點**: {', '.join(p['red_flags'])}")
+            if p.get("insider_tips"):
+                lines.append(f"- **🤫 撇步**: {', '.join(p['insider_tips'])}")
+            if p.get("user_notes"):
+                lines.append(f"- **📝 筆記**: {p['user_notes']}")
+        return "\n".join(lines)
+
+    if mode == "vault_delete":
+        lines.append(f"# 🗑️ TL;DReview 金庫刪除結果：已移除 {result.get('deleted_count', 0)} 間店家")
+        for d in result.get("deleted") or []:
+            lines.append(f"- 已移除：**{d.get('name')}** (`{d.get('place_id')}`)")
+        return "\n".join(lines)
+
+    if mode == "vault_sync":
+        lines.append(
+            f"# 🔄 TL;DReview E2EE 金庫同步完成：共 {result.get('total_places', 0)} 間店家 "
+            f"({'✅ 雲端已同步' if result.get('cloud_synced') else '💾 僅本地快取'})"
+        )
+        if result.get("new_sync_key_generated") and result.get("sync_key"):
+            lines.append(f"\n🔑 新產生的同步金鑰 (`TLDREVIEW_SYNC_KEY`): `{result['sync_key']}`")
+        return "\n".join(lines)
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # CLI Entrypoint
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Extract and curate Google Maps reviews from a URL, store/keyword query "
-            "(with optional coordinates), signboard/menu photo, multi-venue --compare, or --top N discovery."
+            "(with optional coordinates), signboard/menu photo, multi-venue --compare, --top N discovery, "
+            "or manage your E2EE Personal Dining Vault (--vault-save / --vault-query)."
         )
     )
     parser.add_argument(
@@ -2551,8 +3426,8 @@ def main() -> int:
         help="One or more Google Maps links, store names, addresses, or search queries",
     )
     parser.add_argument("--query", "-q", help="Explicit search query (store name, keyword, or address)")
-    parser.add_argument("--lat", type=float, help="User current latitude for nearby search (e.g. 25.0330)")
-    parser.add_argument("--lng", "--lon", dest="lng", type=float, help="User current longitude for nearby search (e.g. 121.5654)")
+    parser.add_argument("--lat", type=float, help="Latitude for nearby search or vault place/query (e.g. 25.0330)")
+    parser.add_argument("--lng", "--lon", dest="lng", type=float, help="Longitude for nearby search or vault place/query (e.g. 121.5654)")
     parser.add_argument("--ll", help="Coordinates in '@lat,lng,15z' or 'lat,lng' format")
     parser.add_argument("--zoom", type=int, default=15, help="Map zoom level when searching with coordinates (default: 15)")
     parser.add_argument("--image", help="Path to a photo of a store signboard, menu, or business card")
@@ -2567,6 +3442,32 @@ def main() -> int:
         default=0,
         help="Area Discovery mode: scan top N organic places nearby, audit manipulation, and crown the true winner",
     )
+    # E2EE Personal Dining Vault flags
+    parser.add_argument("--vault-save", action="store_true", help="Save or update a place in your E2EE Personal Dining Vault")
+    parser.add_argument("--vault-query", action="store_true", help="Query your E2EE Personal Dining Vault (0 SerpApi credits)")
+    parser.add_argument("--vault-delete", action="store_true", help="Delete a place from your Personal Dining Vault")
+    parser.add_argument("--vault-sync", action="store_true", help="Sync and merge local Vault with the E2EE Cloud Relay")
+    parser.add_argument("--sync-key", help="E2EE Sync Key (tld_<vault_id>_<master_secret>) or set TLDREVIEW_SYNC_KEY")
+    parser.add_argument("--place-id", help="Google Maps data_id / place_id for Vault operations")
+    parser.add_argument("--name", help="Store name for Vault save or delete")
+    parser.add_argument("--address", help="Store address for Vault save")
+    parser.add_argument("--google-rating", type=float, help="Google Maps average rating for Vault save")
+    parser.add_argument(
+        "--status",
+        default="wishlist",
+        help="Vault status: wishlist (default), liked, disliked, or all (for --vault-query)",
+    )
+    parser.add_argument("--user-rating", type=float, help="Personal rating (1-5) for Vault save")
+    parser.add_argument("--tags", help="Comma-separated tags for Vault save (e.g. '牛肉麵,大安區')")
+    parser.add_argument("--tag", help="Tag filter for --vault-query")
+    parser.add_argument("--keyword", help="Keyword filter for --vault-query")
+    parser.add_argument("--must-try", help="Comma-separated must-try dishes for Vault save")
+    parser.add_argument("--red-flags", help="Comma-separated red flags / caveats for Vault save")
+    parser.add_argument("--insider-tips", help="Comma-separated insider tips for Vault save")
+    parser.add_argument("--user-notes", help="Personal notes for Vault save")
+    parser.add_argument("--radius-km", type=float, help="Search radius in km for --vault-query with --lat/--lng (default: 5.0)")
+    parser.add_argument("--limit", type=int, default=10, help="Max results to return for --vault-query (default: 10)")
+
     parser.add_argument("--api-key", help="SerpApi API Key (or set SERPAPI_API_KEY in environment / .env)")
     parser.add_argument("--lang", default="zh-TW", help="Preferred summary language code (default: zh-TW)")
     parser.add_argument(
@@ -2583,13 +3484,76 @@ def main() -> int:
     parser.add_argument("--no-cache", action="store_true", help="Ignore the 24h review cache and force fresh SerpApi calls")
     parser.add_argument("--parse-only", action="store_true", help="Only parse URL, query, or EXIF GPS without calling SerpApi")
 
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
     targets: list[str] = []
     if args.query:
         targets.append(args.query)
     if args.urls:
         targets.extend(u for u in args.urls if u and u.strip())
+    if unknown_args:
+        targets.extend(u for u in unknown_args if u and u.strip())
     raw_target = targets[0] if targets else ""
+
+    lat, lng = args.lat, args.lng
+    if args.ll and (lat is None or lng is None):
+        parsed_ll = parse_ll_string(args.ll)
+        if parsed_ll:
+            lat, lng = parsed_ll[0], parsed_ll[1]
+
+    # Handle Vault operations first (no SerpApi key required for local/vault operations!)
+    if args.vault_save or args.vault_query or args.vault_delete or args.vault_sync:
+        try:
+            if args.vault_save:
+                # If status was not explicitly passed, default to wishlist
+                v_res = vault_save_place(
+                    place_id=args.place_id,
+                    name=args.name,
+                    address=args.address,
+                    lat=lat,
+                    lng=lng,
+                    google_rating=args.google_rating,
+                    status=args.status if args.status != "all" else "wishlist",
+                    user_rating=args.user_rating,
+                    tags=args.tags,
+                    must_try=args.must_try,
+                    red_flags=args.red_flags,
+                    insider_tips=args.insider_tips,
+                    user_notes=args.user_notes,
+                    raw_input=raw_target,
+                    sync_key=args.sync_key,
+                    api_key=resolve_api_key(args.api_key),
+                )
+            elif args.vault_query:
+                # If user didn't explicitly pass --status on CLI, query all statuses
+                query_status = args.status if "--status" in sys.argv else "all"
+                v_res = vault_query_places(
+                    status=query_status,
+                    keyword=args.keyword or (raw_target if raw_target else None),
+                    tag=args.tag or args.tags,
+                    lat=lat,
+                    lng=lng,
+                    radius_km=args.radius_km,
+                    limit=args.limit,
+                    sync_key=args.sync_key,
+                )
+            elif args.vault_delete:
+                v_res = vault_delete_place(
+                    place_id=args.place_id,
+                    name=args.name or (raw_target if raw_target else None),
+                    sync_key=args.sync_key,
+                )
+            else:
+                v_res = vault_sync(sync_key=args.sync_key)
+        except Exception as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}), file=sys.stdout)
+            log(f"Vault operation failed: {exc}")
+            return 1
+
+        if args.markdown:
+            print(format_vault_markdown_output(v_res))
+        else:
+            print(json.dumps(v_res, indent=2, ensure_ascii=False), file=sys.stdout)
+        return 0
 
     # Parse only mode
     if args.parse_only:
@@ -2608,11 +3572,6 @@ def main() -> int:
             }, indent=2, ensure_ascii=False), file=sys.stdout)
             return 0
 
-        lat, lng = args.lat, args.lng
-        if args.ll and (lat is None or lng is None):
-            parsed_ll = parse_ll_string(args.ll)
-            if parsed_ll:
-                lat, lng = parsed_ll[0], parsed_ll[1]
         if (lat is None or lng is None) and exif_coords:
             lat, lng = exif_coords
         cleaned_text, inline_coords = extract_inline_coordinates(raw_target)

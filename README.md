@@ -9,7 +9,7 @@
 🌐 **[Official Website (tldreview.app)](https://tldreview.app/)**
 
 [![Website](https://img.shields.io/badge/Website-tldreview.app-blue?logo=googlechrome&logoColor=white)](https://tldreview.app/)
-[![Version](https://img.shields.io/badge/version-2.0.0-orange.svg)](#-whats-new-changelog)
+[![Version](https://img.shields.io/badge/version-3.0.0-orange.svg)](#-whats-new-changelog)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](core/tldreview_tool.py)
@@ -21,6 +21,12 @@
 ---
 
 ## 🆕 What's New (Changelog)
+
+### 🧪 v3.0.0 (Beta / In Testing)
+- 🔒 **Personal Dining Pocket List & Memory Vault (Beta / Testing)**:
+  - **Save Places & Notes Naturally**: After reading a review summary, simply tell your AI: *"Save this to my wishlist"*, *"I ate here and loved it—note: ask for lighter broth next time"*, or *"Add this to my avoid list"*. Your AI saves the restaurant along with its **must-try dishes, red flags, insider tips, and your personal notes**!
+  - **Ask What's Nearby for Free (0 Credits)**: Out in the city and hungry? Just ask: *"Is there anything on my wishlist near me right now?"* Your AI instantly checks your saved list against your GPS coordinates—**using 0 SerpApi credits**.
+  - **No Sign-Up, Private by Default**: No accounts or passwords to register. The first time you save a place, TL;DReview automatically creates a private Sync Key (`TLDREVIEW_SYNC_KEY`) so your list stays end-to-end encrypted across chats and devices—even the cloud relay never sees what restaurants you saved (plus optional one-step export to **Obsidian** Markdown notes).
 
 ### 🚀 v2.0.0
 - 💎 **Zero-Cost Metadata Extraction**: Maximizes SerpApi Place & Review payloads with **zero extra credit usage**:
@@ -43,12 +49,14 @@
 
 ## 🦊 What is TL;DReview?
 
-**TL;DReview** ([https://tldreview.app/](https://tldreview.app/)) is a Google Maps review extraction and intelligence engine built for AI Agents and personal assistants. It supports **five intuitive workflows**:
+**TL;DReview** ([https://tldreview.app/](https://tldreview.app/)) is a Google Maps review extraction and intelligence engine built for AI Agents and personal assistants. It supports **six intuitive workflows**:
 1. 🔗 **Paste any Google Maps URL** (including short links & social redirect wrappers)
 2. 📍 **Ask for a "Nearby" Place** (e.g., *"FamilyMart near me"* / *"附近的全家便利商店"*—your AI Agent acquires your current coordinates, searches Google Maps, and jumps straight into the best-matching store's reviews)
 3. 📸 **Send a Photo of a Store Signboard or Menu** (snap a storefront sign, menu, business card, or address plate—the AI extracts the store name/address and analyzes its reviews)
 4. ⚔️ **Compare Multiple Venues Side-by-Side (`--compare`)** (compare 2–3 restaurants or cafes in a single table)
 5. 🗺️ **Scan & Audit Top-N Nearby Places (`--top 3`)** (strip sponsored ads, audit fake reviews, and find the true organic winner nearby)
+6. 🔒 **Personal Dining Pocket List Vault (`--vault-save` / `--vault-query`, 🧪 Beta)** (save places to your `wishlist`, `liked`, or `disliked` list with personal notes, and find nearby saved spots using 0 SerpApi credits)
+
 
 No matter how you search, TL;DReview distills hundreds of noisy, lengthy reviews into a structured, evidence-backed briefing: **Must-Try Highlights, Strengths, Weaknesses & Red Flags, Insider Tips, Operational Rules, and Transit & Parking**—so you know everything that matters before you go.
 
@@ -226,6 +234,22 @@ python3 core/tldreview_tool.py "Lin Dong Fang Beef Noodle" "Yong Kang Beef Noodl
 # 2F. Area Discovery Top-N Scan + Anti-Manipulation Audit (--top 3, strips Sponsored ads & crowns organic winner)
 python3 core/tldreview_tool.py "ramen near me" --lat 25.0330 --lng 121.5654 --top 3 --lang en --markdown
 
+# 2G. Save / Update a Place in your Zero-Config E2EE Personal Dining Vault
+python3 core/tldreview_tool.py --vault-save \
+  --place-id "0x3442abcd1234:0x9876efgh" \
+  --name "Lao Zhang Beef Noodle" \
+  --lat 25.0330 --lng 121.5654 \
+  --status wishlist \
+  --tags "牛肉麵,大安區" \
+  --must-try "紅燒半筋半肉麵,花椒牛油" \
+  --red-flags "湯頭偏鹹" \
+  --insider-tips "只收現金,11:45前到免排隊" \
+  --user-notes "Take parents next time" \
+  --markdown
+
+# 2H. Query your Personal Dining Vault by status, keyword, or GPS proximity (0 SerpApi credits!)
+python3 core/tldreview_tool.py --vault-query --status wishlist --lat 25.0335 --lng 121.5640 --radius-km 3.0 --markdown
+
 # Advanced options: sort order (newest / lowest / highest) or quota-saving mode (--save-quota)
 python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en --sort-by newest --save-quota --markdown
 
@@ -236,6 +260,22 @@ python3 core/tldreview_tool.py "https://maps.app.goo.gl/sample" --lang en
 pip install -e .
 tldreview "FamilyMart near me" --lat 25.0330 --lng 121.5654 --lang en --markdown
 ```
+
+---
+
+## 🔒 Personal Dining Pocket List Vault (🧪 Beta / In Testing)
+
+Ever look up a great restaurant with your AI, only to forget what to order—or which places to avoid—a week later? Now your AI can remember your personal dining list for you:
+
+- 📌 **Save & Categorize with One Sentence**: Tell your AI to bookmark a spot to your **Wishlist (`wishlist`)**, mark a favorite spot as **Liked (`liked`)**, or put a tourist trap on your **Avoid List (`disliked`)**—complete with its must-try dishes, insider tips, and your own personal notes.
+- 📍 **Instant "What's on My Wishlist Nearby?" Lookup (0 Credits)**: Hungry while walking around? Ask *"Is there anything on my wishlist near me?"* and TL;DReview instantly filters your saved spots by distance—**without spending a single SerpApi credit**.
+- 🔐 **No Sign-Up, 100% Private**: No accounts required. On your first save, TL;DReview automatically generates a private Sync Key (`TLDREVIEW_SYNC_KEY`). Your list is encrypted on your device before syncing to the cloud, so nobody—not even the server—can see your saved places.
+- 📝 **Obsidian Note Export**: Use Obsidian? Set `TLDREVIEW_OBSIDIAN_DIR` to automatically save a neatly formatted Markdown card for every restaurant in your vault.
+
+> [!NOTE]
+> 🧪 **Beta Notice**: The Personal Dining Vault is currently in **v3.0.0 Beta testing**. Feedback and suggestions are welcome!
+
+
 
 ---
 

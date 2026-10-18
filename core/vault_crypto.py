@@ -1,0 +1,53 @@
+"""Zero-Dependency E2EE Cloud Vault (Personal Dining Memory) for TL;DReview.
+
+Implements standard-library-only authenticated encryption (BLAKE2b counter-mode stream cipher
++ HMAC-SHA256 Encrypt-then-MAC + zlib compression + PBKDF2-HMAC-SHA256 key derivation),
+local ~/.tldreview/vault.json persistence, Cloud KV relay sync, and Obsidian Markdown export.
+"""
+from .tldreview_tool import (
+    VAULT_API_DEFAULT_BASE,
+    VALID_VAULT_STATUSES,
+    VaultError,
+    VaultDecryptionError,
+    generate_sync_key,
+    parse_sync_key,
+    derive_write_token,
+    derive_subkeys,
+    encrypt_vault_payload,
+    decrypt_vault_payload,
+    get_vault_path,
+    get_sync_key_path,
+    resolve_sync_key,
+    load_local_vault,
+    save_local_vault,
+    export_obsidian_markdown,
+    vault_save_place,
+    vault_query_places,
+    vault_delete_place,
+    vault_sync,
+    format_vault_markdown_output,
+)
+
+__all__ = [
+    "VAULT_API_DEFAULT_BASE",
+    "VALID_VAULT_STATUSES",
+    "VaultError",
+    "VaultDecryptionError",
+    "generate_sync_key",
+    "parse_sync_key",
+    "derive_write_token",
+    "derive_subkeys",
+    "encrypt_vault_payload",
+    "decrypt_vault_payload",
+    "get_vault_path",
+    "get_sync_key_path",
+    "resolve_sync_key",
+    "load_local_vault",
+    "save_local_vault",
+    "export_obsidian_markdown",
+    "vault_save_place",
+    "vault_query_places",
+    "vault_delete_place",
+    "vault_sync",
+    "format_vault_markdown_output",
+]
