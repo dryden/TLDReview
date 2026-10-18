@@ -35,6 +35,7 @@ import struct
 import sys
 import time
 from typing import Any, Iterable, List, Optional, Tuple
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2561,6 +2562,180 @@ class VaultDecryptionError(VaultError):
     """Raised when E2EE envelope HMAC verification or decryption fails."""
 
 
+class VaultKeyLostError(VaultError):
+    """Raised when an existing vault_id is detected on disk but sync.key is missing (prevents silent key regeneration)."""
+
+
+class VaultKeyCorruptedError(VaultError):
+    """Raised when sync.key exists on disk but is empty or malformed (prevents silent key regeneration)."""
+
+
+class VaultPassphraseError(VaultError):
+    """Raised when a recovery passphrase is too weak or invalid."""
+
+
+_WEAK_PASSPHRASES = {
+    "12345678",
+    "123456789",
+    "1234567890",
+    "password",
+    "password123",
+    "qwertyui",
+    "qwerty123",
+    "abc12345",
+    "00000000",
+    "11111111",
+    "88888888",
+    "admin123",
+    "tldreview",
+}
+
+
+def validate_passphrase_strength(passphrase: str) -> str:
+    """Validate and normalize a user recovery passphrase. Raises VaultPassphraseError if too weak."""
+    norm = unicodedata.normalize("NFC", (passphrase or "").strip())
+    if not norm:
+        raise VaultPassphraseError("Passphrase cannot be empty.")
+
+    cjk_count = sum(1 for ch in norm if "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff")
+    has_min_length = len(norm) >= 8 or (cjk_count >= 5 and len(norm.encode("utf-8")) >= 15)
+    if not has_min_length:
+        raise VaultPassphraseError(
+            "復原密語強度不足：請輸入至少 8 個字元（或至少 5 個中文字的完整句子，例如「我阿嬤煮的紅燒牛肉麵最香」）。"
+        )
+
+    if norm.casefold() in _WEAK_PASSPHRASES or len(set(norm.casefold())) <= 2:
+        raise VaultPassphraseError(
+            "復原密語過於簡單（禁止使用常見弱密碼或重複字元），請換一句只有你知道的句子。"
+        )
+    return norm
+
+
+def derive_escrow_id_and_auth(passphrase: str) -> Tuple[str, str]:
+    """Derive public lookup ID (esc_<28hex>) and Bearer write_token from a normalized passphrase."""
+    norm = validate_passphrase_strength(passphrase)
+    esc_raw = hashlib.pbkdf2_hmac(
+        "sha256",
+        norm.encode("utf-8"),
+        b"tldreview-escrow-lookup-v1",
+        iterations=100_000,
+        dklen=14,
+    )
+    escrow_id = f"esc_{esc_raw.hex()}"
+    write_token = hmac.new(
+        norm.encode("utf-8"),
+        b"tldreview-escrow-auth-v1:" + escrow_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return escrow_id, write_token
+
+
+def derive_passphrase_subkeys(
+    passphrase: str,
+    salt: bytes,
+    kdf_spec: str = "scrypt-n16384-r8-p1",
+) -> Tuple[bytes, bytes, str]:
+    """Derive 32B enc_key and 32B mac_key from passphrase using memory-hard scrypt (fallback: PBKDF2 600k)."""
+    if len(salt) != 16:
+        raise ValueError("Escrow KDF salt must be 16 bytes.")
+    pw_bytes = unicodedata.normalize("NFC", passphrase.strip()).encode("utf-8")
+    if kdf_spec.startswith("scrypt") and hasattr(hashlib, "scrypt"):
+        dk = hashlib.scrypt(
+            pw_bytes,
+            salt=salt,
+            n=16384,
+            r=8,
+            p=1,
+            maxmem=33554432,
+            dklen=64,
+        )
+        return dk[:32], dk[32:64], "scrypt-n16384-r8-p1"
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        pw_bytes,
+        salt,
+        iterations=600_000,
+        dklen=64,
+    )
+    return dk[:32], dk[32:64], "pbkdf2-sha256-600000"
+
+
+def encrypt_escrow_recovery_blob(sync_key: str, passphrase: str) -> dict[str, Any]:
+    """Encrypt a Sync Key under a user Passphrase using memory-hard KDF + BLAKE2b-CTR + HMAC-SHA256."""
+    vault_id, _ = parse_sync_key(sync_key)
+    norm_pw = validate_passphrase_strength(passphrase)
+    salt = secrets.token_bytes(16)
+    enc_key, mac_key, kdf_spec = derive_passphrase_subkeys(norm_pw, salt)
+
+    inner_json = json.dumps(
+        {
+            "v": 1,
+            "sync_key": sync_key.strip(),
+            "vault_id": vault_id,
+            "escrowed_at": _now_iso_utc(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = zlib.compress(inner_json)
+    ciphertext = _blake2b_ctr_xor(compressed, enc_key, salt)
+    tag = hmac.new(
+        mac_key,
+        b"escrow-v1:" + kdf_spec.encode("ascii") + b":" + salt + ciphertext,
+        hashlib.sha256,
+    ).digest()
+    return {
+        "v": 1,
+        "kdf": kdf_spec,
+        "nonce": base64.b64encode(salt).decode("ascii"),
+        "ct": base64.b64encode(ciphertext).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii"),
+        "updated_at": int(time.time()),
+    }
+
+
+def decrypt_escrow_recovery_blob(envelope: dict[str, Any], passphrase: str) -> str:
+    """Verify HMAC and decrypt a Passphrase Escrow recovery_blob back into the original Sync Key."""
+    if not isinstance(envelope, dict) or envelope.get("v") != 1:
+        raise VaultDecryptionError("Unsupported or malformed escrow recovery envelope.")
+    norm_pw = unicodedata.normalize("NFC", (passphrase or "").strip())
+    if not norm_pw:
+        raise VaultPassphraseError("Passphrase cannot be empty.")
+
+    kdf_spec = str(envelope.get("kdf") or "scrypt-n16384-r8-p1")
+    try:
+        salt = base64.b64decode(str(envelope["nonce"]), validate=True)
+        ciphertext = base64.b64decode(str(envelope["ct"]), validate=True)
+        received_tag = base64.b64decode(str(envelope["tag"]), validate=True)
+    except Exception as exc:
+        raise VaultDecryptionError(f"Invalid base64 encoding in escrow recovery blob: {exc}") from None
+
+    if len(salt) != 16 or len(received_tag) != 32:
+        raise VaultDecryptionError("Invalid salt or MAC tag length in escrow recovery blob.")
+
+    enc_key, mac_key, actual_kdf = derive_passphrase_subkeys(norm_pw, salt, kdf_spec=kdf_spec)
+    expected_tag = hmac.new(
+        mac_key,
+        b"escrow-v1:" + actual_kdf.encode("ascii") + b":" + salt + ciphertext,
+        hashlib.sha256,
+    ).digest()
+
+    if not hmac.compare_digest(expected_tag, received_tag):
+        raise VaultDecryptionError(
+            "復原密語驗證失敗（HMAC 不符）：密語輸入錯誤或雲端託管資料已被竄改。"
+        )
+
+    try:
+        compressed = _blake2b_ctr_xor(ciphertext, enc_key, salt)
+        inner_bytes = zlib.decompress(compressed)
+        inner = json.loads(inner_bytes.decode("utf-8"))
+        recovered_key = str(inner["sync_key"]).strip()
+        parse_sync_key(recovered_key)
+        return recovered_key
+    except Exception as exc:
+        raise VaultDecryptionError(f"Failed to decode recovered sync key: {exc}") from None
+
+
 def generate_sync_key() -> str:
     """Generate a high-entropy E2EE Sync Key: tld_<vault_id>_<master_secret>."""
     # Generate 16-char vault_id without underscores so splitting on '_' is unambiguous
@@ -2709,8 +2884,51 @@ def get_sync_key_path() -> str:
     return os.getenv("TLDREVIEW_SYNC_KEY_PATH") or os.path.join(_vault_base_dir(), "sync.key")
 
 
+def get_vault_id_path() -> str:
+    """Return separate non-secret vault_id file path (~/.tldreview/vault_id) for key-loss detection."""
+    if os.getenv("TLDREVIEW_VAULT_ID_PATH"):
+        return os.environ["TLDREVIEW_VAULT_ID_PATH"]
+    return os.path.join(os.path.dirname(get_sync_key_path()), "vault_id")
+
+
+def _persist_vault_id_file(vault_id: str) -> None:
+    vid_path = get_vault_id_path()
+    try:
+        os.makedirs(os.path.dirname(vid_path), exist_ok=True)
+        with open(vid_path, "w", encoding="utf-8") as f:
+            f.write(vault_id.strip() + "\n")
+    except OSError as exc:
+        log(f"Warning: unable to save vault_id to {vid_path}: {exc}")
+
+
+def _read_stored_vault_id(vault_path: Optional[str] = None) -> Optional[str]:
+    """Read previously bound vault_id from ~/.tldreview/vault_id or local vault.json."""
+    vid_path = get_vault_id_path()
+    if os.path.isfile(vid_path):
+        try:
+            with open(vid_path, "r", encoding="utf-8") as f:
+                vid = f.read().strip()
+            if vid and _VAULT_ID_RE.fullmatch(vid):
+                return vid
+        except OSError:
+            pass
+    vpath = vault_path or get_vault_path()
+    if os.path.isfile(vpath):
+        try:
+            with open(vpath, "r", encoding="utf-8") as f:
+                vdata = json.load(f)
+            if isinstance(vdata, dict):
+                vid = str(vdata.get("vault_id") or "").strip()
+                if vid and _VAULT_ID_RE.fullmatch(vid):
+                    return vid
+        except (OSError, ValueError):
+            pass
+    return None
+
+
 def _persist_sync_key_file(sync_key: str) -> None:
     key_path = get_sync_key_path()
+    vault_id, _ = parse_sync_key(sync_key)
     try:
         os.makedirs(os.path.dirname(key_path), exist_ok=True)
         with open(key_path, "w", encoding="utf-8") as f:
@@ -2721,13 +2939,53 @@ def _persist_sync_key_file(sync_key: str) -> None:
             pass
     except OSError as exc:
         log(f"Warning: unable to save sync key to {key_path}: {exc}")
+    _persist_vault_id_file(vault_id)
+
+
+def format_key_handover_notice(
+    sync_key: str,
+    key_path: Optional[str] = None,
+    is_tty: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Build TTY-aware handover metadata when a Sync Key is generated for the first time."""
+    abs_key_path = os.path.abspath(key_path or get_sync_key_path())
+    vault_id, _ = parse_sync_key(sync_key)
+    tty = sys.stdout.isatty() if is_tty is None else bool(is_tty)
+    if tty:
+        summary_msg = (
+            f"🔑 同步金鑰已產生並存於 `{abs_key_path}`（權限 0600）：\n"
+            f"同步金鑰：`{sync_key}`\n"
+            "⚠️ 請立即執行 `--vault-escrow --passphrase \"<設定一句復原密語>\"` 託管金鑰，或將金鑰備份到密碼管理器；"
+            "遺失後雲端加密資料將永久無法解密！"
+        )
+    else:
+        summary_msg = (
+            f"🔑 同步金鑰已自動產生並存於 `{abs_key_path}`（權限 0600，Vault ID: `{vault_id}`）。\n"
+            "⚠️ 因目前非互動式終端機（Agent/Pipe 模式），為安全起見不直接於日誌裸露金鑰本體。\n"
+            "💡 強烈建議立即執行 `--vault-escrow --passphrase \"<設定一句好記的復原密語>\"` 啟用一句話雲端託管，"
+            "或將環境變數 `TLDREVIEW_SYNC_KEY` / `~/.tldreview/` 目錄持久化；若金鑰遺失且未設密語，雲端加密資料將永久無法解密！"
+        )
+    return {
+        "key_generated": True,
+        "vault_id": vault_id,
+        "key_path": abs_key_path,
+        "is_tty": tty,
+        "display_key": sync_key if tty else f"tld_{vault_id}_[STORED_AT_{abs_key_path}]",
+        "message": summary_msg,
+    }
 
 
 def resolve_sync_key(
     explicit_key: Optional[str] = None,
     auto_create: bool = False,
+    vault_path: Optional[str] = None,
 ) -> Tuple[Optional[str], bool]:
-    """Resolve Sync Key from CLI arg -> TLDREVIEW_SYNC_KEY env -> ~/.tldreview/sync.key -> auto-generate."""
+    """Resolve Sync Key from CLI arg -> TLDREVIEW_SYNC_KEY env -> ~/.tldreview/sync.key -> auto-generate.
+
+    Enforces strict key-loss and corruption detection:
+    - If sync.key exists on disk but is empty/corrupted -> raises VaultKeyCorruptedError (never silently overwrites).
+    - If vault_id exists on disk but sync.key is missing -> raises VaultKeyLostError (never silently creates a parallel vault).
+    """
     if explicit_key and explicit_key.strip():
         clean = explicit_key.strip()
         parse_sync_key(clean)
@@ -2737,19 +2995,47 @@ def resolve_sync_key(
     load_dotenv_if_present()
     env_key = os.getenv("TLDREVIEW_SYNC_KEY", "").strip()
     if env_key:
-        parse_sync_key(env_key)
+        try:
+            vid, _ = parse_sync_key(env_key)
+        except VaultError as exc:
+            raise VaultKeyCorruptedError(
+                f"環境變數 TLDREVIEW_SYNC_KEY 格式損毀或不合法：{exc}"
+            ) from exc
+        _persist_vault_id_file(vid)
         return env_key, False
 
     key_path = get_sync_key_path()
-    if os.path.isfile(key_path):
+    abs_key_path = os.path.abspath(key_path)
+    if os.path.exists(key_path):
         try:
             with open(key_path, "r", encoding="utf-8") as f:
                 saved = f.read().strip()
-            if saved:
-                parse_sync_key(saved)
-                return saved, False
-        except (OSError, ValueError):
-            pass
+        except OSError as exc:
+            raise VaultKeyCorruptedError(
+                f"無法讀取同步金鑰檔案 ({abs_key_path})：{exc}。為保護雲端資料，已拒絕自動重建新金鑰。"
+            ) from exc
+        if not saved:
+            raise VaultKeyCorruptedError(
+                f"同步金鑰檔案 ({abs_key_path}) 內容為空（已損毀）！為避免產生平行金庫，系統拒絕自動重建。"
+                "請使用 --vault-recover --passphrase \"<復原密語>\" 或 --sync-key 還原。"
+            )
+        try:
+            vid, _ = parse_sync_key(saved)
+        except VaultError as exc:
+            raise VaultKeyCorruptedError(
+                f"同步金鑰檔案 ({abs_key_path}) 內容損毀：{exc}！為避免產生平行金庫，系統拒絕自動重建。"
+                "請使用 --vault-recover --passphrase \"<復原密語>\" 或 --sync-key 還原。"
+            ) from exc
+        _persist_vault_id_file(vid)
+        return saved, False
+
+    existing_vid = _read_stored_vault_id(vault_path)
+    if existing_vid:
+        raise VaultKeyLostError(
+            f"偵測到既有金庫 ID (`{existing_vid}`)，但同步金鑰檔案 (`{abs_key_path}`) 遺失！"
+            "為避免靜默產生第二把金鑰導致與雲端舊資料永久失聯（平行宇宙），已中止操作。"
+            "請使用 `--vault-recover --passphrase \"<你的復原密語>\"` 找回金鑰，或透過 `--sync-key` / `TLDREVIEW_SYNC_KEY` 匯入既有金鑰。"
+        )
 
     if auto_create:
         new_key = generate_sync_key()
@@ -3252,7 +3538,23 @@ def vault_save_place(
 
     places[place_id] = merged_rec
 
-    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True)
+    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True, vault_path=vault_path)
+    if resolved_key:
+        vid, _ = parse_sync_key(resolved_key)
+        vault["vault_id"] = vid
+
+    # If local vault had no prior places and we are using an existing key, hydrate/verify remote vault first
+    # so we never overwrite cloud data or fork on a decryption mismatch (Section 4 safety rule).
+    if resolved_key and not is_new_key and len(places) == 1 and not existing:
+        remote_vault = _cloud_vault_get(resolved_key)
+        if isinstance(remote_vault, dict) and isinstance(remote_vault.get("places"), dict):
+            for r_pid, r_rec in remote_vault["places"].items():
+                if r_pid == place_id:
+                    merged_rec = _merge_place_records(r_rec, incoming_rec)
+                    places[place_id] = merged_rec
+                elif r_pid not in places:
+                    places[r_pid] = r_rec
+
     global _LAST_VAULT_SYNC_DIAG
     _LAST_VAULT_SYNC_DIAG = {}
     cloud_synced = False
@@ -3283,7 +3585,9 @@ def vault_save_place(
         res["cloud_sync_error"] = diag.get("message")
         res["cloud_sync_hint"] = diag.get("hint")
     if is_new_key and resolved_key:
+        handover = format_key_handover_notice(resolved_key)
         res["sync_key"] = resolved_key
+        res["key_handover"] = handover
     if obsidian_file:
         res["obsidian_path"] = obsidian_file
     return res
@@ -3302,7 +3606,7 @@ def vault_query_places(
 ) -> dict[str, Any]:
     """Query saved places in the Vault with status, keyword, tag, and Haversine radius filtering (0 SerpApi credits)."""
     vault = load_local_vault(vault_path)
-    resolved_key, _ = resolve_sync_key(sync_key, auto_create=False)
+    resolved_key, _ = resolve_sync_key(sync_key, auto_create=False, vault_path=vault_path)
 
     # Hydrate from cloud if local vault has no places yet and a sync key is available
     if not vault.get("places") and resolved_key:
@@ -3417,7 +3721,7 @@ def vault_delete_place(
     _LAST_VAULT_SYNC_DIAG = {}
     cloud_synced = False
     if removed:
-        resolved_key, _ = resolve_sync_key(sync_key, auto_create=False)
+        resolved_key, _ = resolve_sync_key(sync_key, auto_create=False, vault_path=vault_path)
         if resolved_key:
             cloud_synced = _cloud_vault_put(vault, resolved_key)
         vault["sync_pending"] = not cloud_synced
@@ -3443,7 +3747,7 @@ def vault_sync(
     vault_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Pull remote encrypted vault, decrypt, merge with local items (most recent saved_at wins), and push back."""
-    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True)
+    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True, vault_path=vault_path)
     if not resolved_key:
         raise VaultError("Unable to resolve or generate TLDREVIEW_SYNC_KEY.")
 
@@ -3451,6 +3755,8 @@ def vault_sync(
     _LAST_VAULT_SYNC_DIAG = {}
 
     local_vault = load_local_vault(vault_path)
+    vid, _ = parse_sync_key(resolved_key)
+    local_vault["vault_id"] = vid
     local_places: dict[str, dict[str, Any]] = local_vault.get("places") or {}
 
     remote_vault = _cloud_vault_get(resolved_key)
@@ -3501,6 +3807,216 @@ def vault_sync(
         res["cloud_sync_hint"] = diag.get("hint")
     if is_new_key:
         res["sync_key"] = resolved_key
+        res["key_handover"] = format_key_handover_notice(resolved_key)
+    return res
+
+
+def vault_escrow_setup(
+    passphrase: str,
+    sync_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Encrypt the current Sync Key with a user Passphrase (scrypt KDF) and upload recovery_blob to Cloud Relay."""
+    norm_pw = validate_passphrase_strength(passphrase)
+    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True, vault_path=vault_path)
+    if not resolved_key:
+        raise VaultError("Unable to resolve or generate Sync Key for Passphrase Escrow.")
+
+    vault_id, _ = parse_sync_key(resolved_key)
+    escrow_id, write_token = derive_escrow_id_and_auth(norm_pw)
+    envelope = encrypt_escrow_recovery_blob(resolved_key, norm_pw)
+    body_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    target_url = _vault_api_url(escrow_id)
+
+    uploaded = False
+    last_diag: dict[str, Any] = {}
+    if os.getenv("TLDREVIEW_VAULT_OFFLINE", "").strip().lower() not in {"1", "true", "yes"}:
+        for attempt in range(1, VAULT_MAX_RETRIES + 1):
+            req = urllib.request.Request(
+                target_url,
+                data=body_bytes,
+                headers={
+                    "Authorization": f"Bearer {write_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+                method="PUT",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+                    if resp.status in (200, 201):
+                        uploaded = True
+                        break
+            except Exception as exc:
+                last_diag = _classify_vault_error(exc, url=target_url)
+                if last_diag.get("retryable") and attempt < VAULT_MAX_RETRIES:
+                    time.sleep(0.6 * (2 ** (attempt - 1)))
+                    continue
+                break
+
+    vault = load_local_vault(vault_path)
+    vault["vault_id"] = vault_id
+    vault["escrow_configured"] = uploaded
+    vault["escrow_id"] = escrow_id
+    save_local_vault(vault, vault_path)
+
+    res: dict[str, Any] = {
+        "status": "success" if uploaded else "partial",
+        "mode": "vault_escrow",
+        "vault_id": vault_id,
+        "escrow_id": escrow_id,
+        "kdf": envelope.get("kdf"),
+        "cloud_synced": uploaded,
+        "new_sync_key_generated": is_new_key,
+    }
+    if not uploaded and last_diag:
+        res["cloud_sync_error_type"] = last_diag.get("error_type")
+        res["cloud_sync_error"] = last_diag.get("message")
+        res["cloud_sync_hint"] = last_diag.get("hint")
+    return res
+
+
+def vault_recover_from_passphrase(
+    passphrase: str,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Fetch recovery_blob from Cloud Relay using passphrase, decrypt Sync Key, save locally, and sync Vault."""
+    norm_pw = validate_passphrase_strength(passphrase)
+    escrow_id, _ = derive_escrow_id_and_auth(norm_pw)
+    target_url = _vault_api_url(escrow_id)
+
+    req = urllib.request.Request(
+        target_url,
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            envelope = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise VaultPassphraseError(
+                "找不到對應此復原密語的雲端託管金鑰（HTTP 404）：請確認密語是否完全一致（注意大小寫與標點），或先前是否已執行過 --vault-escrow。"
+            ) from None
+        diag = _classify_vault_error(exc, url=target_url)
+        raise VaultError(f"無法取回復原金鑰 ({diag['error_type']}): {diag['message']} | {diag['hint']}") from exc
+    except Exception as exc:
+        diag = _classify_vault_error(exc, url=target_url)
+        raise VaultError(f"無法連線取回復原金鑰 ({diag['error_type']}): {diag['message']} | {diag['hint']}") from exc
+
+    recovered_key = decrypt_escrow_recovery_blob(envelope, norm_pw)
+    vault_id, _ = parse_sync_key(recovered_key)
+    _persist_sync_key_file(recovered_key)
+
+    sync_res = vault_sync(sync_key=recovered_key, vault_path=vault_path)
+    vault = load_local_vault(vault_path)
+    vault["escrow_configured"] = True
+    vault["escrow_id"] = escrow_id
+    save_local_vault(vault, vault_path)
+
+    return {
+        "status": "success",
+        "mode": "vault_recover",
+        "vault_id": vault_id,
+        "escrow_id": escrow_id,
+        "key_path": os.path.abspath(get_sync_key_path()),
+        "restored_places": sync_res.get("total_places", 0),
+        "cloud_synced": sync_res.get("cloud_synced", False),
+    }
+
+
+def vault_export(
+    output_path: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Export decrypted local Vault places as a portable JSON backup file."""
+    vault = load_local_vault(vault_path)
+    places = vault.get("places") or {}
+    export_payload = {
+        "schema_version": 1,
+        "exported_at": _now_iso_utc(),
+        "vault_id": _read_stored_vault_id(vault_path),
+        "total_places": len(places),
+        "places": places,
+    }
+    written_path: Optional[str] = None
+    if output_path and output_path.strip() and output_path.strip() != "-":
+        written_path = os.path.abspath(output_path.strip())
+        os.makedirs(os.path.dirname(written_path) or ".", exist_ok=True)
+        with open(written_path, "w", encoding="utf-8") as f:
+            json.dump(export_payload, f, ensure_ascii=False, indent=2)
+
+    return {
+        "status": "success",
+        "mode": "vault_export",
+        "output_path": written_path,
+        "total_places": len(places),
+        "backup": export_payload,
+    }
+
+
+def vault_import(
+    input_path: str,
+    sync_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Import places from a portable JSON backup file into local Vault and sync to Cloud Relay."""
+    abs_in = os.path.abspath((input_path or "").strip())
+    if not os.path.isfile(abs_in):
+        raise ValueError(f"Backup file not found: {abs_in}")
+    with open(abs_in, "r", encoding="utf-8") as f:
+        backup_data = json.load(f)
+    incoming_places = backup_data.get("places") if isinstance(backup_data, dict) else None
+    if not isinstance(incoming_places, dict):
+        raise ValueError("Invalid backup JSON format: expected top-level 'places' dictionary.")
+
+    # When importing from a backup after key loss, allow generating a fresh key if sync.key is missing
+    key_path = get_sync_key_path()
+    if not sync_key and not os.getenv("TLDREVIEW_SYNC_KEY") and not os.path.exists(key_path):
+        vid_path = get_vault_id_path()
+        if os.path.exists(vid_path):
+            try:
+                os.remove(vid_path)
+            except OSError:
+                pass
+
+    resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True, vault_path=vault_path)
+    vault = load_local_vault(vault_path)
+    if resolved_key:
+        vid, _ = parse_sync_key(resolved_key)
+        vault["vault_id"] = vid
+
+    places = vault.setdefault("places", {})
+    imported_count = 0
+    for pid, rec in incoming_places.items():
+        if not isinstance(rec, dict):
+            continue
+        if pid in places:
+            places[pid] = _merge_place_records(places[pid], rec)
+        else:
+            places[pid] = rec
+        imported_count += 1
+
+    cloud_synced = False
+    if resolved_key:
+        cloud_synced = _cloud_vault_put(vault, resolved_key)
+    vault["sync_pending"] = not cloud_synced
+    saved_file = save_local_vault(vault, vault_path)
+
+    res: dict[str, Any] = {
+        "status": "success",
+        "mode": "vault_import",
+        "input_path": abs_in,
+        "imported_count": imported_count,
+        "total_places": len(places),
+        "vault_path": saved_file,
+        "cloud_synced": cloud_synced,
+        "new_sync_key_generated": is_new_key,
+    }
+    if is_new_key and resolved_key:
+        res["sync_key"] = resolved_key
+        res["key_handover"] = format_key_handover_notice(resolved_key)
     return res
 
 
@@ -3519,34 +4035,24 @@ def vault_status(
             st = str(rec.get("status") or "wishlist").lower()
             status_counts[st] = status_counts.get(st, 0) + 1
 
-    # Resolve key source without auto-creating
+    # Resolve key source without auto-creating (catches VaultKeyLostError / VaultKeyCorruptedError)
     key_source = "not_configured"
     resolved_key: Optional[str] = None
     key_error: Optional[str] = None
-    vault_id: Optional[str] = None
+    vault_id: Optional[str] = _read_stored_vault_id(path)
     try:
-        if sync_key and sync_key.strip():
-            resolved_key = sync_key.strip()
+        resolved_key, _ = resolve_sync_key(sync_key, auto_create=False, vault_path=path)
+        if resolved_key:
             vault_id, _ = parse_sync_key(resolved_key)
-            key_source = "cli_arg"
-        else:
-            load_dotenv_if_present()
-            env_key = os.getenv("TLDREVIEW_SYNC_KEY", "").strip()
-            if env_key:
-                resolved_key = env_key
-                vault_id, _ = parse_sync_key(resolved_key)
+            if sync_key and sync_key.strip():
+                key_source = "cli_arg"
+            elif os.getenv("TLDREVIEW_SYNC_KEY", "").strip():
                 key_source = "env:TLDREVIEW_SYNC_KEY"
             else:
-                kpath = get_sync_key_path()
-                if os.path.isfile(kpath):
-                    with open(kpath, "r", encoding="utf-8") as f:
-                        saved = f.read().strip()
-                    if saved:
-                        resolved_key = saved
-                        vault_id, _ = parse_sync_key(resolved_key)
-                        key_source = f"file:{kpath}"
+                key_source = f"file:{os.path.abspath(get_sync_key_path())}"
     except Exception as exc:
         key_error = str(exc)
+        key_source = "lost_or_corrupted"
 
     api_base = (os.getenv("TLDREVIEW_VAULT_API_URL") or VAULT_API_DEFAULT_BASE).rstrip("/")
     health_url = _vault_health_url()
@@ -3645,16 +4151,18 @@ def vault_status(
         "status": "success",
         "mode": "vault_status",
         "local": {
-            "vault_path": path,
+            "vault_path": os.path.abspath(path),
             "file_exists": local_exists,
             "total_places": len(local_places),
             "status_counts": status_counts,
             "sync_pending": bool(local_vault.get("sync_pending", False)),
+            "escrow_configured": bool(local_vault.get("escrow_configured", False)),
             "updated_at": local_vault.get("updated_at"),
         },
         "sync_key": {
             "configured": bool(resolved_key and vault_id),
             "source": key_source,
+            "key_path": os.path.abspath(get_sync_key_path()),
             "vault_id": vault_id,
             "error": key_error,
         },
@@ -3664,7 +4172,7 @@ def vault_status(
 
 
 def format_vault_markdown_output(result: dict) -> str:
-    """Format Vault save/query/delete/sync/status results into clean human & Agent-friendly Markdown."""
+    """Format Vault save/query/delete/sync/status/escrow/recover/export/import results into Markdown."""
     mode = result.get("mode")
     lines: list[str] = []
 
@@ -3710,12 +4218,11 @@ def format_vault_markdown_output(result: dict) -> str:
                 f"> 💡 **排錯建議**：{hint_msg}",
             ])
         if result.get("new_sync_key_generated") and result.get("sync_key"):
+            handover = result.get("key_handover") or format_key_handover_notice(result["sync_key"])
             lines.extend([
                 "",
                 "> [!IMPORTANT]",
-                f"> 🔑 **首次自動產生 E2EE 跨裝置同步金鑰 (`TLDREVIEW_SYNC_KEY`)**：",
-                f"> `{result['sync_key']}`",
-                "> 請將此金鑰顯示給使用者並存入 AI Agent 記憶（Memory）或環境變數 `TLDREVIEW_SYNC_KEY`，未來在任何雲端沙盒皆可無縫同步個人清單！",
+                f"> {handover['message'].replace(chr(10), chr(10) + '> ')}",
             ])
         return "\n".join(lines)
 
@@ -3774,7 +4281,53 @@ def format_vault_markdown_output(result: dict) -> str:
                 f"> 💡 **排錯建議**: {result.get('cloud_sync_hint', '')}",
             ])
         if result.get("new_sync_key_generated") and result.get("sync_key"):
-            lines.append(f"\n🔑 新產生的同步金鑰 (`TLDREVIEW_SYNC_KEY`): `{result['sync_key']}`")
+            handover = result.get("key_handover") or format_key_handover_notice(result["sync_key"])
+            lines.append(f"\n{handover['message']}")
+        return "\n".join(lines)
+
+    if mode == "vault_escrow":
+        if result.get("cloud_synced"):
+            lines.extend([
+                f"# 🛡️ TL;DReview 復原密語託管成功 (Passphrase Escrow)",
+                f"- **保護對象 Vault ID**: `{result.get('vault_id')}`",
+                f"- **雲端託管識別碼 (`escrow_id`)**: `{result.get('escrow_id')}` (KDF: `{result.get('kdf')}`)",
+                "- **使用方式**: 未來若更換電腦或 AI 沙盒被重置，不需尋找金鑰檔案，只要執行：",
+                "  `python3 core/tldreview_tool.py --vault-recover --passphrase \"<你設定的復原密語>\"` 即可一鍵找回所有清單！",
+                "- ⚠️ **重要提醒**: 雲端伺服器沒有你的密語，若忘記此密語且無本地金鑰備份，將沒有任何客服能為你重設。",
+            ])
+        else:
+            lines.extend([
+                f"# ⚠️ TL;DReview 復原密語託管上傳失敗 (`{result.get('cloud_sync_error_type', 'network_error')}`)",
+                f"- **錯誤原因**: {result.get('cloud_sync_error', '無法連線至雲端中繼站')}",
+                f"- **排錯建議**: {result.get('cloud_sync_hint', '請檢查網路後重試')}",
+            ])
+        return "\n".join(lines)
+
+    if mode == "vault_recover":
+        lines.extend([
+            f"# 🎉 TL;DReview 復原密語驗證成功！金庫已完整找回",
+            f"- **還原之 Vault ID**: `{result.get('vault_id')}`",
+            f"- **金鑰已寫入**: `{result.get('key_path')}` (`0600`)",
+            f"- **已同步找回店家數**: 共 **{result.get('restored_places', 0)}** 間餐廳",
+        ])
+        return "\n".join(lines)
+
+    if mode == "vault_export":
+        lines.append(f"# 📦 TL;DReview 金庫明文備份匯出完成 (共 {result.get('total_places', 0)} 間店)")
+        if result.get("output_path"):
+            lines.append(f"- **備份檔案路徑**: `{result['output_path']}`")
+        else:
+            lines.append("```json")
+            lines.append(json.dumps(result.get("backup"), ensure_ascii=False, indent=2))
+            lines.append("```")
+        return "\n".join(lines)
+
+    if mode == "vault_import":
+        lines.extend([
+            f"# 📥 TL;DReview 金庫備份匯入完成：已匯入 {result.get('imported_count', 0)} 間店 (總計 {result.get('total_places', 0)} 間)",
+            f"- **來源檔案**: `{result.get('input_path')}`",
+            f"- **雲端同步狀態**: {'✅ 已同步至雲端' if result.get('cloud_synced') else '⚠️ 僅存於本地快取'}",
+        ])
         return "\n".join(lines)
 
     if mode == "vault_status":
@@ -3783,18 +4336,19 @@ def format_vault_markdown_output(result: dict) -> str:
         cr = result.get("cloud_relay") or {}
         rv = result.get("remote_vault") or {}
         counts = loc.get("status_counts") or {}
+        escrow_str = "✅ 已啟用密語託管" if loc.get("escrow_configured") else "ℹ️ 尚未設定 `--vault-escrow` 復原密語"
         lines.append("# 🩺 TL;DReview 個人美食金庫連線與狀態診斷 (`--vault-status`)")
         lines.append(
             f"1. **本地快取 (`{loc.get('vault_path')}`)**: "
             f"共 **{loc.get('total_places', 0)}** 間店 "
             f"(📌 想去 `{counts.get('wishlist', 0)}` / ❤️ 喜歡 `{counts.get('liked', 0)}` / 💣 避雷 `{counts.get('disliked', 0)}`) | "
-            f"待同步 (`sync_pending`): `{loc.get('sync_pending')}`"
+            f"待同步 (`sync_pending`): `{loc.get('sync_pending')}` | {escrow_str}"
         )
         if sk.get("configured"):
             lines.append(f"2. **E2EE 同步金鑰**: ✅ 已設定 (來源: `{sk.get('source')}` | Vault ID: `{sk.get('vault_id')}`)")
         else:
-            err_suffix = f" ({sk.get('error')})" if sk.get("error") else ""
-            lines.append(f"2. **E2EE 同步金鑰**: ⚠️ 尚未設定{err_suffix}")
+            err_suffix = f" — ❌ **{sk.get('error')}**" if sk.get("error") else ""
+            lines.append(f"2. **E2EE 同步金鑰 (`{sk.get('key_path')}`)**: ⚠️ 尚未就緒{err_suffix}")
         if cr.get("reachable"):
             lines.append(f"3. **Cloudflare 雲端中繼站 (`{cr.get('api_base_url')}`)**: ✅ 連線正常 (`{cr.get('latency_ms')} ms`)")
         else:
@@ -3828,7 +4382,7 @@ def main() -> int:
         description=(
             "Extract and curate Google Maps reviews from a URL, store/keyword query "
             "(with optional coordinates), signboard/menu photo, multi-venue --compare, --top N discovery, "
-            "or manage your E2EE Personal Dining Vault (--vault-save / --vault-query / --vault-status)."
+            "or manage your E2EE Personal Dining Vault (--vault-save / --vault-query / --vault-status / --vault-escrow / --vault-recover)."
         )
     )
     parser.add_argument(
@@ -3859,6 +4413,11 @@ def main() -> int:
     parser.add_argument("--vault-delete", action="store_true", help="Delete a place from your Personal Dining Vault")
     parser.add_argument("--vault-sync", action="store_true", help="Sync and merge local Vault with the E2EE Cloud Relay")
     parser.add_argument("--vault-status", action="store_true", help="Run diagnostics on local Vault, Sync Key, and Cloud Relay connectivity")
+    parser.add_argument("--vault-escrow", action="store_true", help="Back up your Sync Key to the Cloud Relay encrypted with a memorable Passphrase (--passphrase)")
+    parser.add_argument("--vault-recover", action="store_true", help="Recover your Sync Key and Vault on a new device/VM using your Passphrase (--passphrase)")
+    parser.add_argument("--passphrase", help="Memorable recovery passphrase for --vault-escrow or --vault-recover")
+    parser.add_argument("--vault-export", nargs="?", const="-", help="Export decrypted Vault places to a JSON backup file (or '-' for stdout)")
+    parser.add_argument("--vault-import", help="Import Vault places from a JSON backup file")
     parser.add_argument("--sync-key", help="E2EE Sync Key (tld_<vault_id>_<master_secret>) or set TLDREVIEW_SYNC_KEY")
     parser.add_argument("--place-id", help="Google Maps data_id / place_id for Vault operations")
     parser.add_argument("--name", help="Store name for Vault save or delete")
@@ -3913,10 +4472,19 @@ def main() -> int:
             lat, lng = parsed_ll[0], parsed_ll[1]
 
     # Handle Vault operations first (no SerpApi key required for local/vault operations!)
-    if args.vault_save or args.vault_query or args.vault_delete or args.vault_sync or args.vault_status:
+    if (
+        args.vault_save
+        or args.vault_query
+        or args.vault_delete
+        or args.vault_sync
+        or args.vault_status
+        or args.vault_escrow
+        or args.vault_recover
+        or args.vault_export is not None
+        or args.vault_import
+    ):
         try:
             if args.vault_save:
-                # If status was not explicitly passed, default to wishlist
                 v_res = vault_save_place(
                     place_id=args.place_id,
                     name=args.name,
@@ -3935,8 +4503,10 @@ def main() -> int:
                     sync_key=args.sync_key,
                     api_key=resolve_api_key(args.api_key),
                 )
+                if args.passphrase:
+                    esc_res = vault_escrow_setup(args.passphrase, sync_key=args.sync_key)
+                    v_res["escrow"] = esc_res
             elif args.vault_query:
-                # If user didn't explicitly pass --status on CLI, query all statuses
                 query_status = args.status if "--status" in sys.argv else "all"
                 v_res = vault_query_places(
                     status=query_status,
@@ -3954,6 +4524,21 @@ def main() -> int:
                     name=args.name or (raw_target if raw_target else None),
                     sync_key=args.sync_key,
                 )
+            elif args.vault_escrow:
+                pw = args.passphrase or raw_target
+                if not pw:
+                    raise VaultPassphraseError("--vault-escrow requires --passphrase \"<你的復原密語>\".")
+                v_res = vault_escrow_setup(pw, sync_key=args.sync_key)
+            elif args.vault_recover:
+                pw = args.passphrase or raw_target
+                if not pw:
+                    raise VaultPassphraseError("--vault-recover requires --passphrase \"<你的復原密語>\".")
+                v_res = vault_recover_from_passphrase(pw)
+            elif args.vault_export is not None:
+                out_p = args.vault_export if args.vault_export != "-" else (raw_target or None)
+                v_res = vault_export(output_path=out_p)
+            elif args.vault_import:
+                v_res = vault_import(args.vault_import, sync_key=args.sync_key)
             elif args.vault_status:
                 v_res = vault_status(sync_key=args.sync_key)
             else:

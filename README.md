@@ -82,8 +82,17 @@ Ask your AI anytime—queries run locally with GPS distance calculation and use 
 - **Revisit Favorites by Tag**: *"Show me places I've `liked` that are tagged `family-friendly`."*
 - **Check Your Avoid List**: *"What restaurants are on my `disliked` blacklist?"*
 
-### 3️⃣ Zero Sign-Up, End-to-End Encrypted & Obsidian-Ready
-- 🔐 **No Account Needed, Private by Default**: On your first save, TL;DReview auto-generates a private `TLDREVIEW_SYNC_KEY` (`tld_...`). Your list is encrypted client-side using Python's standard library before syncing, so even the cloud server never sees your restaurants.
+### 3️⃣ Passphrase Escrow, Recovery & Honest Security Model
+Because AI Agents often run inside ephemeral cloud VMs (like Meta Muse or Grok) where `~/.tldreview/sync.key` can be wiped when a container resets, v3.0.0 includes **Passphrase Escrow**—inspired by iCloud Keychain Recovery, 1Password Secret Key, and Signal PIN:
+
+- 🗣️ **Recover with One Memorable Sentence (No Raw Keys to Copy)**:
+  - **Set a Recovery Passphrase**: Tell your AI *"Set my dining vault recovery passphrase to 'Grandma makes the best braised beef noodles'"* (`--vault-escrow --passphrase "..."`). Your `sync_key` is encrypted client-side using a memory-hard KDF (`hashlib.scrypt`) into a `recovery_blob` stored on the relay.
+  - **One-Command Recovery on Any New Device/VM**: Run `--vault-recover --passphrase "Grandma makes the best braised beef noodles"` to fetch and decrypt your `sync_key` and restore your entire restaurant vault!
+- 🛡️ **No Silent Key Loss or "Parallel Universe" Vaults**: Non-secret `~/.tldreview/vault_id` is stored separately from `~/.tldreview/sync.key` (`0600`). If `sync.key` is missing or corrupted while `vault_id` exists, TL;DReview **hard-errors and refuses to silently generate a second key**, prompting you to recover via `--vault-recover` or `--vault-import`.
+- 🔍 **Honest Threat Model & Durability Contract**:
+  - **What E2EE Protects Against**: Even the cloud relay server (Cloudflare Worker / KV) **never sees what restaurants you saved**. All encryption happens client-side before upload.
+  - **Agent-as-Custodian Model**: Because the AI Agent decrypts and queries your vault, the Agent's runtime holds the key (`~/.tldreview/sync.key`) and caches plaintext locally at `~/.tldreview/vault.json`. In Docker or ephemeral VMs, mount `~/.tldreview/` as a persistent volume or enable `--vault-escrow`.
+  - **Honest Passphrase Tradeoffs**: ① Weak passphrases can be brute-forced offline if the blob is obtained—mitigated via minimum strength checks, memory-hard `scrypt` KDF, and strict server-side rate limiting (max 5 escrow reads/min per IP); ② **Forgetting your passphrase (without a key/JSON backup) means permanent data loss**—there is no support desk that can reset it.
 - 📝 **Obsidian Note Export**: Set `TLDREVIEW_OBSIDIAN_DIR=/path/to/obsidian/vault` to automatically export a clean Markdown card for every saved restaurant.
 
 > [!NOTE]
@@ -173,6 +182,15 @@ python3 core/tldreview_tool.py --vault-save \
 # 5. Query Your Vault by Status, Tag, or GPS Radius (0 SerpApi credits!)
 python3 core/tldreview_tool.py --vault-query --status wishlist --lat 25.0335 --lng 121.5640 --radius-km 3.0 --markdown
 python3 core/tldreview_tool.py --vault-query --status liked --tag "family-friendly" --markdown
+
+# 6. Passphrase Escrow (--vault-escrow) & One-Command Recovery (--vault-recover)
+python3 core/tldreview_tool.py --vault-escrow --passphrase "Grandma makes the best braised beef noodles" --markdown
+python3 core/tldreview_tool.py --vault-recover --passphrase "Grandma makes the best braised beef noodles" --markdown
+
+# 7. Vault Diagnostics (--vault-status) & Portable JSON Backup (--vault-export / --vault-import)
+python3 core/tldreview_tool.py --vault-status --markdown
+python3 core/tldreview_tool.py --vault-export ./my_dining_backup.json
+python3 core/tldreview_tool.py --vault-import ./my_dining_backup.json --markdown
 ```
 
 ---

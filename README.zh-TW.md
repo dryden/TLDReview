@@ -85,9 +85,18 @@ Google Maps 內建摘要最多只有三行空泛描述；而若直接把 Google 
 - **找「去過很喜歡」的愛店二訪**：*「幫我列出我之前去過覺得『很喜歡』、而且有『長輩友善』標籤的店」*
 - **避開黑名單**：*「幫我看看我的避雷黑名單有哪些店？」*
 
-### 3️⃣ 免註冊、隱私全加密 & Obsidian 支援
-- 🔐 **免註冊端到端加密（E2EE）**：第一次存店時，系統會自動產生一組專屬同步金鑰 `TLDREVIEW_SYNC_KEY`（格式 `tld_...`）。名單在離開你的裝置前就會完成加密（100% 使用 Python 標準庫），連雲端同步中繼站也看不到你存了什麼店。
-- 📝 **Obsidian 自動匯出**：若有使用 Obsidian，只要設定環境變數 `TLDREVIEW_OBSIDIAN_DIR=/你的/Obsidian路徑`，每次存店就會自動幫你產生一張排版精美的 Markdown 餐廳筆記卡！
+### 3️⃣ 一句話密語託管 (Passphrase Escrow)、跨裝置復原 & 安全模型
+由於許多使用者是在雲端 AI 沙盒（如 Meta Muse / Grok VM）中操作，當容器重置或換電腦時，要求使用者手動去翻找 `~/.tldreview/sync.key` 並不切實際。因此 v3.0.0 內建了與 iCloud 鑰匙圈 / Signal PIN 同概念的 **Passphrase Escrow（一句話密語託管）**：
+
+- 🗣️ **用一句話託管與復原金鑰（不需抄寫亂碼）**：
+  - **設定復原密語**：告訴 AI *「幫我設定美食金庫復原密語：『我阿嬤煮的紅燒牛肉麵最香』」*（執行 `--vault-escrow --passphrase "..."`）。系統會在本地透過高成本記憶體硬化函數（`scrypt` KDF）衍生金鑰，將你的 `sync_key` 加密成 `recovery_blob` 存放於雲端。
+  - **換裝置或 VM 重置後一鍵找回**：在新環境只要執行 `--vault-recover --passphrase "我阿嬤煮的紅燒牛肉麵最香"`，就能自動取回並解開金鑰，把雲端所有口袋清單完整同步回來！
+- 🛡️ **拒絕「靜默死亡」與平行金庫**：系統將非機密的 `~/.tldreview/vault_id` 與機密的 `~/.tldreview/sync.key`（權限 `0600`）分開保存。若金鑰檔案遺失或損毀，系統會**明確報錯中止**並引導你使用密語復原，絕不會偷偷產生第二把新金鑰導致與舊資料失聯。同時支援 `--vault-export` / `--vault-import` 匯出明文 JSON 備份。
+- 🔍 **誠實的安全邊界與耐久性約定（Threat Model & Durability Contract）**：
+  - **防範範圍（連雲端伺服器也看不到）**：餐廳名單在離開執行環境前即完成端到端加密（E2EE），Cloudflare Worker 與 KV 資料庫只看得到密文，即使雲端資料庫外洩也不會洩露你的口袋清單。
+  - **Agent 代管定位（Agent-as-Custodian）**：在 AI Agent 沙盒中，Agent 為執行加解密必須持有金鑰，且本地快取 `~/.tldreview/vault.json` 為明文儲存；因此防護對象是「雲端中繼伺服器」，而非執行該程式的本機或 Agent 本身。若在 Docker 或臨時容器執行，建議掛載 `~/.tldreview/` 目錄或設定復原密語。
+  - **密語託管的誠實限制**：① 弱密語可能遭離線暴力猜測，因此系統強制要求密語強度、採用高成本 `scrypt` KDF，並在雲端對取回託管區塊實施嚴格限流（每分鐘最多 5 次）；② **忘記復原密語且無金鑰備份等於永久無法解密雲端資料**，沒有任何客服能重設（這與 Signal PIN、1Password Secret Key 是相同的真正 E2EE 取捨）。
+- 📝 **Obsidian 自動匯出**：若有使用 Obsidian，設定環境變數 `TLDREVIEW_OBSIDIAN_DIR=/你的/Obsidian路徑`，每次存店就會自動匯出排版精美的 Markdown 餐廳筆記卡！
 
 > [!NOTE]
 > 🧪 **狀態說明**：個人美食口袋名單金庫目前為 **v3.0.0 Beta 測試中功能**，歡迎試用並提供回饋！
@@ -177,6 +186,15 @@ python3 core/tldreview_tool.py --vault-save \
 # 5. 查詢附近 3 公里內的「想去清單」或「喜歡名單」（消耗 0 點 SerpApi 額度！）
 python3 core/tldreview_tool.py --vault-query --status wishlist --lat 25.0335 --lng 121.5640 --radius-km 3.0 --markdown
 python3 core/tldreview_tool.py --vault-query --status liked --tag "長輩友善" --markdown
+
+# 6. 設定「一句話復原密語」託管金鑰 (--vault-escrow) 與跨裝置/VM 重置後一鍵復原 (--vault-recover)
+python3 core/tldreview_tool.py --vault-escrow --passphrase "我阿嬤煮的紅燒牛肉麵最香" --markdown
+python3 core/tldreview_tool.py --vault-recover --passphrase "我阿嬤煮的紅燒牛肉麵最香" --markdown
+
+# 7. 金庫連線與狀態診斷 (--vault-status) / 匯出與匯入明文備份 (--vault-export / --vault-import)
+python3 core/tldreview_tool.py --vault-status --markdown
+python3 core/tldreview_tool.py --vault-export ./my_dining_backup.json
+python3 core/tldreview_tool.py --vault-import ./my_dining_backup.json --markdown
 ```
 
 ---

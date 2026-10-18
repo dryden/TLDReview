@@ -117,9 +117,26 @@ export default {
     }
 
     const kvKey = `vault:${vaultId}`;
+    const isEscrowBlob = vaultId.startsWith("esc_");
+    const clientIp = request.headers.get("CF-Connecting-IP") || "anon";
 
     // GET /v1/vault/:vault_id
     if (request.method === "GET") {
+      // Strict per-IP rate limiting on Passphrase Escrow recovery blob fetches (max 5 reads / min)
+      if (isEscrowBlob) {
+        const escrowRlKey = `rl_esc_get:${clientIp}:${Math.floor(Date.now() / (RATE_LIMIT_WINDOW_SEC * 1000))}`;
+        const escrowReads = Number((await env.VAULT_KV.get(escrowRlKey)) || "0");
+        if (escrowReads >= 5) {
+          return jsonResponse(
+            { status: "error", message: "Too many passphrase recovery attempts. Please wait 60 seconds." },
+            429
+          );
+        }
+        await env.VAULT_KV.put(escrowRlKey, String(escrowReads + 1), {
+          expirationTtl: RATE_LIMIT_WINDOW_SEC,
+        });
+      }
+
       const stored = await env.VAULT_KV.get(kvKey, { type: "text" });
       if (!stored) {
         return jsonResponse({ status: "error", message: "Vault not found." }, 404);
@@ -166,11 +183,11 @@ export default {
         return jsonResponse({ status: "error", message: validationErr }, 400);
       }
 
-      // Per-IP + vault_id lightweight rate limit check via KV if needed
-      const clientIp = request.headers.get("CF-Connecting-IP") || "anon";
+      // Per-IP + vault_id lightweight rate limit check via KV
+      const maxWrites = isEscrowBlob ? 5 : RATE_LIMIT_MAX_WRITES;
       const rlKey = `rl:${vaultId}:${clientIp}:${Math.floor(Date.now() / (RATE_LIMIT_WINDOW_SEC * 1000))}`;
       const currentHits = Number((await env.VAULT_KV.get(rlKey)) || "0");
-      if (currentHits >= RATE_LIMIT_MAX_WRITES) {
+      if (currentHits >= maxWrites) {
         return jsonResponse({ status: "error", message: "Rate limit exceeded. Try again in a minute." }, 429);
       }
 
@@ -184,13 +201,17 @@ export default {
         }
       }
 
-      const normalizedEnvelope = JSON.stringify({
+      const normalizedObj = {
         v: 1,
         nonce: envelope.nonce,
         ct: envelope.ct,
         tag: envelope.tag,
         updated_at: envelope.updated_at,
-      });
+      };
+      if (typeof envelope.kdf === "string" && envelope.kdf.length <= 64) {
+        normalizedObj.kdf = envelope.kdf;
+      }
+      const normalizedEnvelope = JSON.stringify(normalizedObj);
 
       await env.VAULT_KV.put(kvKey, normalizedEnvelope, {
         metadata: {

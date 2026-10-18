@@ -10,19 +10,30 @@ from unittest.mock import patch
 from core.vault_crypto import (
     VaultDecryptionError,
     VaultError,
+    VaultKeyCorruptedError,
+    VaultKeyLostError,
+    VaultPassphraseError,
     _classify_vault_error,
+    decrypt_escrow_recovery_blob,
     decrypt_vault_payload,
+    derive_escrow_id_and_auth,
     derive_subkeys,
     derive_write_token,
+    encrypt_escrow_recovery_blob,
     encrypt_vault_payload,
     export_obsidian_markdown,
+    format_key_handover_notice,
     format_vault_markdown_output,
     generate_sync_key,
+    get_vault_id_path,
     load_local_vault,
     parse_sync_key,
     resolve_sync_key,
     save_local_vault,
+    validate_passphrase_strength,
     vault_delete_place,
+    vault_export,
+    vault_import,
     vault_query_places,
     vault_save_place,
     vault_status,
@@ -389,6 +400,87 @@ class TestVaultStorageAndQuery(unittest.TestCase):
         md = format_vault_markdown_output(st)
         self.assertIn("--vault-status", md)
         self.assertIn("診斷", md)
+
+    def test_passphrase_escrow_roundtrip_and_strength(self) -> None:
+        # 1. Weak passphrases must be rejected
+        for weak in ("12345678", "password", "short", "aaaaaaaaaa", "牛肉麵"):
+            with self.assertRaises(VaultPassphraseError):
+                validate_passphrase_strength(weak)
+
+        # 2. Good Chinese & English passphrases must succeed and round-trip encrypt/decrypt sync_key
+        sync_key = generate_sync_key()
+        passphrase = "我阿嬤煮的紅燒牛肉麵最香"
+        esc_id1, token1 = derive_escrow_id_and_auth(passphrase)
+        esc_id2, token2 = derive_escrow_id_and_auth("  我阿嬤煮的紅燒牛肉麵最香  ")
+        self.assertEqual(esc_id1, esc_id2)
+        self.assertEqual(token1, token2)
+        self.assertTrue(esc_id1.startswith("esc_"))
+
+        blob = encrypt_escrow_recovery_blob(sync_key, passphrase)
+        self.assertNotIn(sync_key, json.dumps(blob))
+        recovered = decrypt_escrow_recovery_blob(blob, passphrase)
+        self.assertEqual(recovered, sync_key)
+
+        # 3. Wrong passphrase must fail HMAC verification
+        with self.assertRaises(VaultDecryptionError):
+            decrypt_escrow_recovery_blob(blob, "隔壁老王煮的陽春麵比較鹹")
+
+    def test_key_loss_and_corruption_detection_prevents_silent_regeneration(self) -> None:
+        # 1. Initial save creates sync.key AND vault_id
+        res = vault_save_place(
+            place_id="loss_test_1",
+            name="永康牛肉麵",
+            status="wishlist",
+        )
+        orig_key = res["sync_key"]
+        orig_vid, _ = parse_sync_key(orig_key)
+        self.assertTrue(os.path.isfile(self.key_path))
+        self.assertTrue(os.path.isfile(get_vault_id_path()))
+
+        # 2. Simulate corrupted sync.key -> must raise VaultKeyCorruptedError (NEVER silently regenerate!)
+        with open(self.key_path, "w", encoding="utf-8") as f:
+            f.write("corrupted_garbage_key\n")
+        with self.assertRaises(VaultKeyCorruptedError):
+            resolve_sync_key(auto_create=True)
+
+        # 3. Simulate deleted sync.key while vault_id still exists -> must raise VaultKeyLostError!
+        os.remove(self.key_path)
+        with self.assertRaises(VaultKeyLostError):
+            vault_save_place(name="另一家店", status="wishlist")
+
+        # 4. Restoring the original key via explicit --sync-key recovers cleanly
+        restored, is_new = resolve_sync_key(explicit_key=orig_key, auto_create=True)
+        self.assertEqual(restored, orig_key)
+        self.assertFalse(is_new)
+        vid_now, _ = parse_sync_key(restored or "")
+        self.assertEqual(vid_now, orig_vid)
+
+    def test_isatty_handover_notice_and_export_import_backup(self) -> None:
+        sync_key = generate_sync_key()
+        # TTY mode shows full key
+        tty_notice = format_key_handover_notice(sync_key, key_path=self.key_path, is_tty=True)
+        self.assertIn(sync_key, tty_notice["message"])
+        # Non-TTY (Agent/Pipe) mode redacts raw key and shows absolute path
+        non_tty_notice = format_key_handover_notice(sync_key, key_path=self.key_path, is_tty=False)
+        self.assertNotIn(sync_key, non_tty_notice["message"])
+        self.assertIn(os.path.abspath(self.key_path), non_tty_notice["message"])
+
+        # Export & Import after key loss
+        vault_save_place(place_id="exp_1", name="阜杭豆漿", status="liked", must_try="厚燒餅夾蛋")
+        backup_file = os.path.join(self.temp_dir.name, "backup.json")
+        exp_res = vault_export(output_path=backup_file)
+        self.assertEqual(exp_res["total_places"], 1)
+        self.assertTrue(os.path.isfile(backup_file))
+
+        # Simulate catastrophic VM wipe (both sync.key and vault.json gone, only backup.json saved)
+        os.remove(self.key_path)
+        os.remove(self.vault_path)
+        imp_res = vault_import(backup_file)
+        self.assertEqual(imp_res["imported_count"], 1)
+        self.assertTrue(imp_res["new_sync_key_generated"])
+        q_res = vault_query_places(status="all")
+        self.assertEqual(q_res["matched_count"], 1)
+        self.assertEqual(q_res["places"][0]["name"], "阜杭豆漿")
 
 
 if __name__ == "__main__":
