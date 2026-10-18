@@ -2810,13 +2810,118 @@ def _vault_api_url(vault_id: str) -> str:
     return f"{base}/{urllib.parse.quote(vault_id)}"
 
 
+def _vault_health_url() -> str:
+    base = (os.getenv("TLDREVIEW_VAULT_API_URL") or VAULT_API_DEFAULT_BASE).rstrip("/")
+    if base.endswith("/v1/vault"):
+        return base[: -len("/v1/vault")] + "/health"
+    return f"{base}/health"
+
+
+VAULT_MAX_RETRIES = 3
+_LAST_VAULT_SYNC_DIAG: dict[str, Any] = {}
+
+
+def _classify_vault_error(exc: Exception, url: str = "") -> dict[str, Any]:
+    """Classify a Cloud Vault HTTP/network exception into actionable diagnostics and retryability."""
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace").strip()[:240]
+        except Exception:
+            pass
+        detail = err_body or str(exc.reason or exc)
+        if code in (401, 403):
+            return {
+                "error_type": "auth_error",
+                "http_status": code,
+                "retryable": False,
+                "message": f"HTTP {code} Unauthorized/Forbidden: {detail}",
+                "hint": (
+                    "設定錯誤（重試無效）：目前的 TLDREVIEW_SYNC_KEY 派生的 write_token 與雲端該金庫建立時不一致。"
+                    "請確認環境變數 TLDREVIEW_SYNC_KEY 或 ~/.tldreview/sync.key 是否正確。"
+                ),
+            }
+        if code == 413:
+            return {
+                "error_type": "payload_too_large",
+                "http_status": code,
+                "retryable": False,
+                "message": f"HTTP 413 Payload Too Large: {detail}",
+                "hint": "金庫加密後超過雲端單筆上限 (512KB)，請使用 --vault-delete 清理部分舊紀錄。",
+            }
+        if code == 429:
+            return {
+                "error_type": "rate_limit",
+                "http_status": code,
+                "retryable": True,
+                "message": f"HTTP 429 Too Many Requests: {detail}",
+                "hint": "請求過於頻繁，請稍後執行 --vault-sync 重試。",
+            }
+        if 400 <= code < 500:
+            return {
+                "error_type": "client_error",
+                "http_status": code,
+                "retryable": False,
+                "message": f"HTTP {code} Client Error: {detail}",
+                "hint": "請求格式或 TLDREVIEW_VAULT_API_URL 路由設定錯誤（重試無效），請執行 --vault-status 檢查設定。",
+            }
+        return {
+            "error_type": "server_error",
+            "http_status": code,
+            "retryable": True,
+            "message": f"HTTP {code} Server Error: {detail}",
+            "hint": "Cloudflare Worker 暫時異常或 KV 尚未綁定，請稍後執行 --vault-sync 重試。",
+        }
+
+    reason = getattr(exc, "reason", exc)
+    exc_str = str(exc)
+    is_timeout = (
+        isinstance(exc, TimeoutError)
+        or isinstance(reason, TimeoutError)
+        or "timed out" in exc_str.lower()
+        or "timeout" in exc_str.lower()
+    )
+    if is_timeout:
+        return {
+            "error_type": "timeout",
+            "http_status": None,
+            "retryable": True,
+            "message": f"Network timeout ({VAULT_HTTP_TIMEOUT}s) connecting to {url or 'Cloud Vault'}: {exc}",
+            "hint": "網路連線超時（已自動重試）。可能是暫時性網路抖動或 Worker 冷啟動，稍後執行 --vault-sync 即可補推上雲端。",
+        }
+
+    is_local_refused = isinstance(reason, ConnectionRefusedError) or "127.0.0.1" in url or "localhost" in url
+    return {
+        "error_type": "network_blocked",
+        "http_status": None,
+        "retryable": not is_local_refused,
+        "message": f"Network/DNS or sandbox firewall blocked connection to {url or 'Cloud Vault'}: {exc}",
+        "hint": (
+            "無法連線至雲端中繼站。若在 AI 沙盒環境（如 Meta Muse / Grok）執行，"
+            "請確認已開通網域 tldreview-vault-relay.cloudflare-d19.workers.dev 的外網權限，或執行 --vault-status 診斷。"
+        ),
+    }
+
+
 def _cloud_vault_put(vault_data: dict[str, Any], sync_key: str) -> bool:
-    """Encrypt and PUT vault data to Cloudflare Worker KV relay. Returns True on success."""
+    """Encrypt and PUT vault data to Cloudflare Worker KV relay with automatic retry. Returns True on success."""
+    global _LAST_VAULT_SYNC_DIAG
+    _LAST_VAULT_SYNC_DIAG = {}
+
     if os.getenv("TLDREVIEW_VAULT_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        _LAST_VAULT_SYNC_DIAG = {
+            "error_type": "offline_mode",
+            "http_status": None,
+            "retryable": False,
+            "attempts": 0,
+            "message": "TLDREVIEW_VAULT_OFFLINE is enabled.",
+            "hint": "目前處於強制離線模式（TLDREVIEW_VAULT_OFFLINE=1），僅儲存於本地快取。",
+        }
         return False
+
     vault_id, _ = parse_sync_key(sync_key)
     write_token = derive_write_token(sync_key)
-    # Strip local-only sync_pending flag from encrypted cloud payload
     clean_payload = {
         "schema_version": vault_data.get("schema_version", 1),
         "updated_at": vault_data.get("updated_at") or _now_iso_utc(),
@@ -2824,51 +2929,102 @@ def _cloud_vault_put(vault_data: dict[str, Any], sync_key: str) -> bool:
     }
     envelope = encrypt_vault_payload(clean_payload, sync_key)
     body_bytes = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+    target_url = _vault_api_url(vault_id)
 
-    req = urllib.request.Request(
-        _vault_api_url(vault_id),
-        data=body_bytes,
-        headers={
-            "Authorization": f"Bearer {write_token}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-        method="PUT",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
-            return resp.status in (200, 201)
-    except Exception as exc:
-        log(f"Cloud Vault sync skipped/offline (saved locally): {exc}")
-        return False
+    max_attempts = VAULT_MAX_RETRIES
+    for attempt in range(1, max_attempts + 1):
+        req = urllib.request.Request(
+            target_url,
+            data=body_bytes,
+            headers={
+                "Authorization": f"Bearer {write_token}",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            method="PUT",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+                if resp.status in (200, 201):
+                    _LAST_VAULT_SYNC_DIAG = {}
+                    return True
+        except Exception as exc:
+            diag = _classify_vault_error(exc, url=target_url)
+            diag["attempts"] = attempt
+            _LAST_VAULT_SYNC_DIAG = diag
+            if diag.get("retryable") and attempt < max_attempts:
+                backoff_s = 0.6 * (2 ** (attempt - 1))
+                log(
+                    f"Cloud Vault PUT transient error ({diag['error_type']}, attempt {attempt}/{max_attempts}), "
+                    f"retrying in {backoff_s:.1f}s: {diag['message']}"
+                )
+                time.sleep(backoff_s)
+                continue
+            log(
+                f"Cloud Vault sync failed [{diag['error_type']}] after {attempt} attempt(s) (saved locally): "
+                f"{diag['message']} | Hint: {diag['hint']}"
+            )
+            return False
+    return False
 
 
 def _cloud_vault_get(sync_key: str) -> Optional[dict[str, Any]]:
-    """GET and decrypt remote vault from Cloudflare Worker KV relay. Returns None if 404 or unreachable."""
+    """GET and decrypt remote vault from Cloudflare Worker KV relay with automatic retry. Returns None if 404 or unreachable."""
+    global _LAST_VAULT_SYNC_DIAG
     if os.getenv("TLDREVIEW_VAULT_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
         return None
     vault_id, _ = parse_sync_key(sync_key)
-    req = urllib.request.Request(
-        _vault_api_url(vault_id),
-        headers={
-            "Accept": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            envelope = json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        log(f"Cloud Vault GET HTTP {exc.code}: {exc}")
-        return None
-    except Exception as exc:
-        log(f"Cloud Vault GET unreachable: {exc}")
-        return None
+    target_url = _vault_api_url(vault_id)
 
+    max_attempts = VAULT_MAX_RETRIES
+    envelope: Optional[dict[str, Any]] = None
+    for attempt in range(1, max_attempts + 1):
+        req = urllib.request.Request(
+            target_url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                envelope = json.loads(raw)
+                break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            diag = _classify_vault_error(exc, url=target_url)
+            diag["attempts"] = attempt
+            _LAST_VAULT_SYNC_DIAG = diag
+            if diag.get("retryable") and attempt < max_attempts:
+                backoff_s = 0.6 * (2 ** (attempt - 1))
+                log(
+                    f"Cloud Vault GET transient HTTP {exc.code} (attempt {attempt}/{max_attempts}), "
+                    f"retrying in {backoff_s:.1f}s..."
+                )
+                time.sleep(backoff_s)
+                continue
+            log(f"Cloud Vault GET failed [{diag['error_type']}]: {diag['message']}")
+            return None
+        except Exception as exc:
+            diag = _classify_vault_error(exc, url=target_url)
+            diag["attempts"] = attempt
+            _LAST_VAULT_SYNC_DIAG = diag
+            if diag.get("retryable") and attempt < max_attempts:
+                backoff_s = 0.6 * (2 ** (attempt - 1))
+                log(
+                    f"Cloud Vault GET transient error ({diag['error_type']}, attempt {attempt}/{max_attempts}), "
+                    f"retrying in {backoff_s:.1f}s..."
+                )
+                time.sleep(backoff_s)
+                continue
+            log(f"Cloud Vault GET unreachable [{diag['error_type']}]: {diag['message']}")
+            return None
+
+    if envelope is None:
+        return None
     return decrypt_vault_payload(envelope, sync_key)
 
 
@@ -3097,6 +3253,8 @@ def vault_save_place(
     places[place_id] = merged_rec
 
     resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True)
+    global _LAST_VAULT_SYNC_DIAG
+    _LAST_VAULT_SYNC_DIAG = {}
     cloud_synced = False
     if resolved_key:
         cloud_synced = _cloud_vault_put(vault, resolved_key)
@@ -3115,6 +3273,15 @@ def vault_save_place(
         "sync_pending": vault["sync_pending"],
         "new_sync_key_generated": is_new_key,
     }
+    if not cloud_synced:
+        diag = _LAST_VAULT_SYNC_DIAG or {
+            "error_type": "unknown_error",
+            "message": "Cloud Vault sync did not complete (saved locally).",
+            "hint": "請執行 --vault-status 檢查連線狀態，或稍後執行 --vault-sync 重試。",
+        }
+        res["cloud_sync_error_type"] = diag.get("error_type")
+        res["cloud_sync_error"] = diag.get("message")
+        res["cloud_sync_hint"] = diag.get("hint")
     if is_new_key and resolved_key:
         res["sync_key"] = resolved_key
     if obsidian_file:
@@ -3246,6 +3413,8 @@ def vault_delete_place(
         for pid in to_delete:
             removed.append(places.pop(pid))
 
+    global _LAST_VAULT_SYNC_DIAG
+    _LAST_VAULT_SYNC_DIAG = {}
     cloud_synced = False
     if removed:
         resolved_key, _ = resolve_sync_key(sync_key, auto_create=False)
@@ -3254,7 +3423,7 @@ def vault_delete_place(
         vault["sync_pending"] = not cloud_synced
         save_local_vault(vault, vault_path)
 
-    return {
+    res: dict[str, Any] = {
         "status": "success",
         "mode": "vault_delete",
         "deleted_count": len(removed),
@@ -3262,6 +3431,11 @@ def vault_delete_place(
         "remaining_count": len(places),
         "cloud_synced": cloud_synced,
     }
+    if removed and not cloud_synced and _LAST_VAULT_SYNC_DIAG:
+        res["cloud_sync_error_type"] = _LAST_VAULT_SYNC_DIAG.get("error_type")
+        res["cloud_sync_error"] = _LAST_VAULT_SYNC_DIAG.get("message")
+        res["cloud_sync_hint"] = _LAST_VAULT_SYNC_DIAG.get("hint")
+    return res
 
 
 def vault_sync(
@@ -3272,6 +3446,9 @@ def vault_sync(
     resolved_key, is_new_key = resolve_sync_key(sync_key, auto_create=True)
     if not resolved_key:
         raise VaultError("Unable to resolve or generate TLDREVIEW_SYNC_KEY.")
+
+    global _LAST_VAULT_SYNC_DIAG
+    _LAST_VAULT_SYNC_DIAG = {}
 
     local_vault = load_local_vault(vault_path)
     local_places: dict[str, dict[str, Any]] = local_vault.get("places") or {}
@@ -3313,13 +3490,169 @@ def vault_sync(
         "vault_path": saved_file,
         "new_sync_key_generated": is_new_key,
     }
+    if not cloud_synced:
+        diag = _LAST_VAULT_SYNC_DIAG or {
+            "error_type": "unknown_error",
+            "message": "Cloud Vault sync did not complete (saved locally).",
+            "hint": "請執行 --vault-status 檢查連線狀態，或稍後執行 --vault-sync 重試。",
+        }
+        res["cloud_sync_error_type"] = diag.get("error_type")
+        res["cloud_sync_error"] = diag.get("message")
+        res["cloud_sync_hint"] = diag.get("hint")
     if is_new_key:
         res["sync_key"] = resolved_key
     return res
 
 
+def vault_status(
+    sync_key: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Run 3-layer diagnostics on local Vault file, Sync Key configuration, and Cloud Relay connectivity."""
+    path = vault_path or get_vault_path()
+    local_exists = os.path.isfile(path)
+    local_vault = load_local_vault(path)
+    local_places: dict[str, dict[str, Any]] = local_vault.get("places") or {}
+    status_counts = {"wishlist": 0, "liked": 0, "disliked": 0}
+    for rec in local_places.values():
+        if isinstance(rec, dict):
+            st = str(rec.get("status") or "wishlist").lower()
+            status_counts[st] = status_counts.get(st, 0) + 1
+
+    # Resolve key source without auto-creating
+    key_source = "not_configured"
+    resolved_key: Optional[str] = None
+    key_error: Optional[str] = None
+    vault_id: Optional[str] = None
+    try:
+        if sync_key and sync_key.strip():
+            resolved_key = sync_key.strip()
+            vault_id, _ = parse_sync_key(resolved_key)
+            key_source = "cli_arg"
+        else:
+            load_dotenv_if_present()
+            env_key = os.getenv("TLDREVIEW_SYNC_KEY", "").strip()
+            if env_key:
+                resolved_key = env_key
+                vault_id, _ = parse_sync_key(resolved_key)
+                key_source = "env:TLDREVIEW_SYNC_KEY"
+            else:
+                kpath = get_sync_key_path()
+                if os.path.isfile(kpath):
+                    with open(kpath, "r", encoding="utf-8") as f:
+                        saved = f.read().strip()
+                    if saved:
+                        resolved_key = saved
+                        vault_id, _ = parse_sync_key(resolved_key)
+                        key_source = f"file:{kpath}"
+    except Exception as exc:
+        key_error = str(exc)
+
+    api_base = (os.getenv("TLDREVIEW_VAULT_API_URL") or VAULT_API_DEFAULT_BASE).rstrip("/")
+    health_url = _vault_health_url()
+    offline_flag = os.getenv("TLDREVIEW_VAULT_OFFLINE", "").strip().lower() in {"1", "true", "yes"}
+
+    relay_health: dict[str, Any] = {
+        "api_base_url": api_base,
+        "health_url": health_url,
+        "offline_mode": offline_flag,
+        "reachable": False,
+        "latency_ms": None,
+    }
+    if not offline_flag:
+        t0 = time.monotonic()
+        req = urllib.request.Request(
+            health_url,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+                relay_health["reachable"] = resp.status == 200
+                relay_health["http_status"] = resp.status
+                relay_health["latency_ms"] = round((time.monotonic() - t0) * 1000)
+        except Exception as exc:
+            diag = _classify_vault_error(exc, url=health_url)
+            relay_health["error_type"] = diag["error_type"]
+            relay_health["error"] = diag["message"]
+            relay_health["hint"] = diag["hint"]
+
+    remote_info: dict[str, Any] = {
+        "checked": False,
+        "exists": False,
+        "decryption_ok": None,
+        "remote_places_count": None,
+        "in_sync": False,
+    }
+    if resolved_key and vault_id and relay_health.get("reachable"):
+        remote_info["checked"] = True
+        target_url = _vault_api_url(vault_id)
+        req = urllib.request.Request(
+            target_url,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=VAULT_HTTP_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                envelope = json.loads(raw)
+                remote_info["exists"] = True
+                remote_info["envelope_updated_at"] = envelope.get("updated_at")
+                try:
+                    decrypted = decrypt_vault_payload(envelope, resolved_key)
+                    r_places = decrypted.get("places") or {}
+                    remote_info["decryption_ok"] = True
+                    remote_info["remote_places_count"] = len(r_places)
+                    remote_info["remote_updated_at"] = decrypted.get("updated_at")
+                    remote_info["in_sync"] = (
+                        not local_vault.get("sync_pending", False)
+                        and set(local_places.keys()) == set(r_places.keys())
+                    )
+                except VaultDecryptionError as dexc:
+                    remote_info["decryption_ok"] = False
+                    remote_info["error_type"] = "decryption_error"
+                    remote_info["error"] = str(dexc)
+                    remote_info["hint"] = "雲端金庫存在但本地金鑰無法解密（HMAC 驗證失敗），請確認兩端 TLDREVIEW_SYNC_KEY 是否相同。"
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                remote_info["exists"] = False
+                remote_info["remote_places_count"] = 0
+                remote_info["in_sync"] = len(local_places) == 0 and not local_vault.get("sync_pending", False)
+            else:
+                diag = _classify_vault_error(exc, url=target_url)
+                remote_info["error_type"] = diag["error_type"]
+                remote_info["error"] = diag["message"]
+                remote_info["hint"] = diag["hint"]
+        except Exception as exc:
+            diag = _classify_vault_error(exc, url=target_url)
+            remote_info["error_type"] = diag["error_type"]
+            remote_info["error"] = diag["message"]
+            remote_info["hint"] = diag["hint"]
+
+    return {
+        "status": "success",
+        "mode": "vault_status",
+        "local": {
+            "vault_path": path,
+            "file_exists": local_exists,
+            "total_places": len(local_places),
+            "status_counts": status_counts,
+            "sync_pending": bool(local_vault.get("sync_pending", False)),
+            "updated_at": local_vault.get("updated_at"),
+        },
+        "sync_key": {
+            "configured": bool(resolved_key and vault_id),
+            "source": key_source,
+            "vault_id": vault_id,
+            "error": key_error,
+        },
+        "cloud_relay": relay_health,
+        "remote_vault": remote_info,
+    }
+
+
 def format_vault_markdown_output(result: dict) -> str:
-    """Format Vault save/query/delete/sync results into clean human & Agent-friendly Markdown."""
+    """Format Vault save/query/delete/sync/status results into clean human & Agent-friendly Markdown."""
     mode = result.get("mode")
     lines: list[str] = []
 
@@ -3349,8 +3682,21 @@ def format_vault_markdown_output(result: dict) -> str:
             lines.append(f"- **🤫 內行撇步**: {', '.join(p['insider_tips'])}")
         if p.get("user_notes"):
             lines.append(f"- **📝 個人筆記**: {p['user_notes']}")
-        sync_state = "✅ 已 E2EE 端到端加密同步至雲端" if result.get("cloud_synced") else "💾 已儲存於本地快取 (待連線同步)"
-        lines.append(f"- **同步狀態**: {sync_state} (金庫共 {result.get('total_saved_places', 1)} 間店)")
+        if result.get("cloud_synced"):
+            lines.append(f"- **同步狀態**: ✅ 已 E2EE 端到端加密同步至雲端 (金庫共 {result.get('total_saved_places', 1)} 間店)")
+        else:
+            lines.append(
+                f"- **同步狀態**: ⚠️ **僅存於本地快取，雲端同步未完成 (`sync_pending: true`)** (本地共 {result.get('total_saved_places', 1)} 間店)"
+            )
+            err_msg = result.get("cloud_sync_error") or "無法連線至雲端中繼站"
+            err_type = result.get("cloud_sync_error_type") or "network_error"
+            hint_msg = result.get("cloud_sync_hint") or "請執行 --vault-status 檢查連線狀態，或稍後執行 --vault-sync 補推上雲端。"
+            lines.extend([
+                "",
+                "> [!WARNING]",
+                f"> ⚠️ **雲端同步失敗 (`{err_type}`)**：{err_msg}",
+                f"> 💡 **排錯建議**：{hint_msg}",
+            ])
         if result.get("new_sync_key_generated") and result.get("sync_key"):
             lines.extend([
                 "",
@@ -3363,7 +3709,6 @@ def format_vault_markdown_output(result: dict) -> str:
 
     if mode == "vault_query":
         places = result.get("places") or []
-        f_meta = result.get("filters") or {}
         lines.append(
             f"# 🗂️ TL;DReview 個人美食金庫查詢結果 (符合 {result.get('matched_count', 0)} / 總計 {result.get('total_in_vault', 0)} 間)"
         )
@@ -3395,15 +3740,69 @@ def format_vault_markdown_output(result: dict) -> str:
         lines.append(f"# 🗑️ TL;DReview 金庫刪除結果：已移除 {result.get('deleted_count', 0)} 間店家")
         for d in result.get("deleted") or []:
             lines.append(f"- 已移除：**{d.get('name')}** (`{d.get('place_id')}`)")
+        if result.get("deleted_count", 0) > 0 and not result.get("cloud_synced"):
+            lines.append(
+                f"- ⚠️ **雲端尚未同步 (`{result.get('cloud_sync_error_type', 'offline')}`)**: {result.get('cloud_sync_error', '')}"
+            )
         return "\n".join(lines)
 
     if mode == "vault_sync":
-        lines.append(
-            f"# 🔄 TL;DReview E2EE 金庫同步完成：共 {result.get('total_places', 0)} 間店家 "
-            f"({'✅ 雲端已同步' if result.get('cloud_synced') else '💾 僅本地快取'})"
-        )
+        if result.get("cloud_synced"):
+            lines.append(
+                f"# 🔄 TL;DReview E2EE 金庫同步完成：共 {result.get('total_places', 0)} 間店家 (✅ 雲端已同步)"
+            )
+        else:
+            lines.append(
+                f"# ⚠️ TL;DReview E2EE 金庫同步未完成：本地共 {result.get('total_places', 0)} 間店家 (⚠️ 僅存於本地快取)"
+            )
+            lines.extend([
+                "",
+                "> [!WARNING]",
+                f"> ⚠️ **雲端同步失敗 (`{result.get('cloud_sync_error_type', 'network_error')}`)**: {result.get('cloud_sync_error', '')}",
+                f"> 💡 **排錯建議**: {result.get('cloud_sync_hint', '')}",
+            ])
         if result.get("new_sync_key_generated") and result.get("sync_key"):
             lines.append(f"\n🔑 新產生的同步金鑰 (`TLDREVIEW_SYNC_KEY`): `{result['sync_key']}`")
+        return "\n".join(lines)
+
+    if mode == "vault_status":
+        loc = result.get("local") or {}
+        sk = result.get("sync_key") or {}
+        cr = result.get("cloud_relay") or {}
+        rv = result.get("remote_vault") or {}
+        counts = loc.get("status_counts") or {}
+        lines.append("# 🩺 TL;DReview 個人美食金庫連線與狀態診斷 (`--vault-status`)")
+        lines.append(
+            f"1. **本地快取 (`{loc.get('vault_path')}`)**: "
+            f"共 **{loc.get('total_places', 0)}** 間店 "
+            f"(📌 想去 `{counts.get('wishlist', 0)}` / ❤️ 喜歡 `{counts.get('liked', 0)}` / 💣 避雷 `{counts.get('disliked', 0)}`) | "
+            f"待同步 (`sync_pending`): `{loc.get('sync_pending')}`"
+        )
+        if sk.get("configured"):
+            lines.append(f"2. **E2EE 同步金鑰**: ✅ 已設定 (來源: `{sk.get('source')}` | Vault ID: `{sk.get('vault_id')}`)")
+        else:
+            err_suffix = f" ({sk.get('error')})" if sk.get("error") else ""
+            lines.append(f"2. **E2EE 同步金鑰**: ⚠️ 尚未設定{err_suffix}")
+        if cr.get("reachable"):
+            lines.append(f"3. **Cloudflare 雲端中繼站 (`{cr.get('api_base_url')}`)**: ✅ 連線正常 (`{cr.get('latency_ms')} ms`)")
+        else:
+            lines.append(
+                f"3. **Cloudflare 雲端中繼站 (`{cr.get('api_base_url')}`)**: ❌ 無法連線 (`{cr.get('error_type', 'offline')}`: {cr.get('error', '')})"
+            )
+            if cr.get("hint"):
+                lines.append(f"   - 💡 **排錯建議**: {cr['hint']}")
+        if rv.get("checked"):
+            if rv.get("exists") and rv.get("decryption_ok"):
+                sync_badge = "✅ 本地與雲端完全一致" if rv.get("in_sync") else "⚠️ 本地與雲端有差異（請執行 `--vault-sync`）"
+                lines.append(
+                    f"4. **雲端加密金庫驗證**: ✅ 雲端共有 **{rv.get('remote_places_count', 0)}** 間店 (E2EE 解密驗證通過) | {sync_badge}"
+                )
+            elif not rv.get("exists"):
+                lines.append("4. **雲端加密金庫驗證**: ℹ️ 雲端尚無此 Vault ID 的紀錄（請執行 `--vault-sync` 首次推送）")
+            else:
+                lines.append(f"4. **雲端加密金庫驗證**: ❌ 驗證失敗 (`{rv.get('error_type')}`: {rv.get('error')})")
+                if rv.get("hint"):
+                    lines.append(f"   - 💡 **排錯建議**: {rv['hint']}")
         return "\n".join(lines)
 
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -3417,7 +3816,7 @@ def main() -> int:
         description=(
             "Extract and curate Google Maps reviews from a URL, store/keyword query "
             "(with optional coordinates), signboard/menu photo, multi-venue --compare, --top N discovery, "
-            "or manage your E2EE Personal Dining Vault (--vault-save / --vault-query)."
+            "or manage your E2EE Personal Dining Vault (--vault-save / --vault-query / --vault-status)."
         )
     )
     parser.add_argument(
@@ -3447,6 +3846,7 @@ def main() -> int:
     parser.add_argument("--vault-query", action="store_true", help="Query your E2EE Personal Dining Vault (0 SerpApi credits)")
     parser.add_argument("--vault-delete", action="store_true", help="Delete a place from your Personal Dining Vault")
     parser.add_argument("--vault-sync", action="store_true", help="Sync and merge local Vault with the E2EE Cloud Relay")
+    parser.add_argument("--vault-status", action="store_true", help="Run diagnostics on local Vault, Sync Key, and Cloud Relay connectivity")
     parser.add_argument("--sync-key", help="E2EE Sync Key (tld_<vault_id>_<master_secret>) or set TLDREVIEW_SYNC_KEY")
     parser.add_argument("--place-id", help="Google Maps data_id / place_id for Vault operations")
     parser.add_argument("--name", help="Store name for Vault save or delete")
@@ -3501,7 +3901,7 @@ def main() -> int:
             lat, lng = parsed_ll[0], parsed_ll[1]
 
     # Handle Vault operations first (no SerpApi key required for local/vault operations!)
-    if args.vault_save or args.vault_query or args.vault_delete or args.vault_sync:
+    if args.vault_save or args.vault_query or args.vault_delete or args.vault_sync or args.vault_status:
         try:
             if args.vault_save:
                 # If status was not explicitly passed, default to wishlist
@@ -3542,6 +3942,8 @@ def main() -> int:
                     name=args.name or (raw_target if raw_target else None),
                     sync_key=args.sync_key,
                 )
+            elif args.vault_status:
+                v_res = vault_status(sync_key=args.sync_key)
             else:
                 v_res = vault_sync(sync_key=args.sync_key)
         except Exception as exc:

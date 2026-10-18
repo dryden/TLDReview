@@ -25,6 +25,8 @@ from .tldreview_tool import (
     vault_query_places,
     vault_delete_place,
     vault_sync,
+    vault_status,
+    _classify_vault_error,
     format_vault_markdown_output,
 )
 
@@ -49,5 +51,7 @@ __all__ = [
     "vault_query_places",
     "vault_delete_place",
     "vault_sync",
+    "vault_status",
+    "_classify_vault_error",
     "format_vault_markdown_output",
 ]

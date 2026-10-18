@@ -10,6 +10,7 @@ from unittest.mock import patch
 from core.vault_crypto import (
     VaultDecryptionError,
     VaultError,
+    _classify_vault_error,
     decrypt_vault_payload,
     derive_subkeys,
     derive_write_token,
@@ -24,6 +25,7 @@ from core.vault_crypto import (
     vault_delete_place,
     vault_query_places,
     vault_save_place,
+    vault_status,
     vault_sync,
 )
 
@@ -335,6 +337,58 @@ class TestVaultStorageAndQuery(unittest.TestCase):
         query_data = json.loads(query_proc.stdout)
         self.assertEqual(query_data["matched_count"], 1)
         self.assertEqual(query_data["places"][0]["name"], "林東芳牛肉麵")
+
+    def test_error_classification_and_explicit_warning_on_save_failure(self) -> None:
+        import io
+        import urllib.error
+
+        # 1. Verify error classification distinguishes 403 auth_error vs timeout vs 502 server_error
+        err_403 = urllib.error.HTTPError(
+            url="https://example.com/v1/vault/abc",
+            code=403,
+            msg="Forbidden",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=io.BytesIO(b'{"error":"Invalid write_token"}'),
+        )
+        diag_403 = _classify_vault_error(err_403)
+        self.assertEqual(diag_403["error_type"], "auth_error")
+        self.assertFalse(diag_403["retryable"])
+
+        diag_timeout = _classify_vault_error(TimeoutError("timed out"))
+        self.assertEqual(diag_timeout["error_type"], "timeout")
+        self.assertTrue(diag_timeout["retryable"])
+
+        # 2. Verify vault_save_place surfaces explicit warning in JSON & Markdown when cloud sync fails
+        self.mock_put.return_value = False
+        res = vault_save_place(
+            place_id="offline_test_1",
+            name="測試離線餐廳",
+            status="wishlist",
+        )
+        self.assertFalse(res["cloud_synced"])
+        self.assertTrue(res["sync_pending"])
+        self.assertIn("cloud_sync_error", res)
+        self.assertIn("cloud_sync_hint", res)
+
+        md = format_vault_markdown_output(res)
+        self.assertIn("⚠️", md)
+        self.assertIn("僅存於本地快取", md)
+
+    def test_vault_status_diagnostics(self) -> None:
+        vault_save_place(
+            place_id="status_test_1",
+            name="診斷測試牛肉麵",
+            status="liked",
+        )
+        with patch.dict(os.environ, {"TLDREVIEW_VAULT_OFFLINE": "1"}, clear=False):
+            st = vault_status()
+        self.assertEqual(st["mode"], "vault_status")
+        self.assertEqual(st["local"]["total_places"], 1)
+        self.assertEqual(st["local"]["status_counts"]["liked"], 1)
+        self.assertTrue(st["sync_key"]["configured"])
+        md = format_vault_markdown_output(st)
+        self.assertIn("--vault-status", md)
+        self.assertIn("診斷", md)
 
 
 if __name__ == "__main__":
